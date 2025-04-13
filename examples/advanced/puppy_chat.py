@@ -1,30 +1,48 @@
+"""
+Robot Chatbot - Runs in a separate terminal and sends audio/emotion data to AudioGripperController
+
+Usage:
+    python robot_chatbot.py --mistral-api-key=YOUR_API_KEY
+"""
+
 import time
-import requests
-import json
-import os
-from collections import deque
-import threading
 import argparse
-from kokoro import KPipeline
-import sounddevice as sd
+import threading
 import numpy as np
+import os
+import json
+import socket
+import requests
+import sounddevice as sd
 import torch
+import logging
 from colorama import Fore, Style, init
 
+# Set up logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 
-class PuppyChatbot:
-    def __init__(self, api_key, lip_sync_callback, voice="af_heart", lang_code="a"):
+# Import Kokoro TTS
+try:
+    from kokoro import KPipeline
+except ImportError:
+    logging.error("Kokoro TTS not installed. Please install with: pip install kokoro")
+    raise
+
+# Constants for socket communication
+HOST = '127.0.0.1'  # localhost
+PORT = 65432        # Port to listen on (non-privileged ports are > 1023)
+
+class RobotChatbot:
+    def __init__(self, api_key, voice="af_heart", lang_code="a"):
         """
-        Initialize the Puppy chatbot with Mistral API and Kokoro TTS.
+        Initialize the Robot chatbot with Mistral API and Kokoro TTS.
         
         Args:
             api_key (str): Mistral API key
-            lip_sync_callback (function): Callback function for lip sync, called with audio chunks
             voice (str, optional): Voice to use for TTS. Defaults to "af_heart".
             lang_code (str, optional): Language code. Defaults to "a".
         """
         self.api_key = api_key
-        self.lip_sync_callback = lip_sync_callback
         self.voice = voice
         self.lang_code = lang_code
         
@@ -39,20 +57,72 @@ class PuppyChatbot:
         # Initialize colorama
         init()
         
-        # Initialize the audio buffer
-        self.audio_buffer = deque()
-        
         # Initialize Kokoro TTS pipeline
         self.tts_pipeline = KPipeline(lang_code=self.lang_code)
         
         # Message history for context
         self.history = []
         
-        # Start the lip sync thread
+        # Create socket server
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            self.sock.bind((HOST, PORT))
+            self.sock.listen()
+            logging.info(f"Chatbot server listening on {HOST}:{PORT}")
+            
+            # Accept connections in a separate thread
+            self.accept_thread = threading.Thread(target=self._accept_connections)
+            self.accept_thread.daemon = True
+            self.accept_thread.start()
+        except OSError as e:
+            logging.error(f"Socket error: {e}")
+            self.sock = None
+
+        # Flag to indicate running state
         self.running = True
-        self.lip_sync_thread = threading.Thread(target=self._lip_sync_worker)
-        self.lip_sync_thread.daemon = True
-        self.lip_sync_thread.start()
+        
+        # Connection to AudioGripperController
+        self.connection = None
+        
+        logging.info("Robot Chatbot initialized!")
+
+    def _accept_connections(self):
+        """Accept connections from AudioGripperController."""
+        while self.running:
+            try:
+                conn, addr = self.sock.accept()
+                logging.info(f"Connected by {addr}")
+                self.connection = conn
+            except Exception as e:
+                if self.running:
+                    logging.error(f"Connection error: {e}")
+                time.sleep(1)
+
+    def _send_audio_data(self, audio_data, emotion):
+        """Send audio data and emotion to the AudioGripperController."""
+        if self.connection:
+            try:
+                # Convert audio data to list for JSON serialization
+                audio_list = audio_data.tolist()
+                
+                # Create JSON message with audio data and emotion
+                message = {
+                    "emotion": emotion,
+                    "audio_data": audio_list
+                }
+                
+                # Send message length first (4 bytes)
+                message_bytes = json.dumps(message).encode('utf-8')
+                message_length = len(message_bytes).to_bytes(4, byteorder='big')
+                self.connection.sendall(message_length)
+                
+                # Send actual message
+                self.connection.sendall(message_bytes)
+                
+                logging.debug(f"Sent audio data with emotion: {emotion}")
+            except Exception as e:
+                logging.error(f"Error sending audio data: {e}")
+                self.connection = None
 
     def _change_mood(self, user_input):
         """
@@ -75,7 +145,7 @@ class PuppyChatbot:
         if requested_mood in self.available_moods:
             old_mood = self.mood
             self.mood = requested_mood
-            print(f"{Fore.CYAN}🐶 Mood changed from {old_mood} to {self.mood}{Style.RESET_ALL}")
+            print(f"{Fore.CYAN}🤖 Mood changed from {old_mood} to {self.mood}{Style.RESET_ALL}")
             return True
         else:
             # List available moods
@@ -83,17 +153,6 @@ class PuppyChatbot:
             print(f"{Fore.YELLOW}Available moods: {moods_list}{Style.RESET_ALL}")
             return True  # Still handled the command, even if mood didn't change
 
-    def _lip_sync_worker(self):
-        """Worker thread that calls the lip sync callback every 1ms with new audio data."""
-        while self.running:
-            if self.audio_buffer:
-                # Get audio chunk from buffer
-                audio_chunk = self.audio_buffer.popleft()
-                # Call the lip sync callback with the audio chunk
-                self.lip_sync_callback(audio_chunk)
-            # Sleep for 1ms
-            time.sleep(0.001)
-    
     def _call_mistral_api(self, user_message):
         """
         Call the Mistral API with the user message and conversation history.
@@ -111,7 +170,7 @@ class PuppyChatbot:
         self.history.append({"role": "user", "content": user_message})
         
         # Create a system message to instruct about structured output format
-        system_message = f"""You are a puppy chatbot at an AI hackathon. Your starting mood is {self.mood.upper()}. ONLY respond with the exact format below - nothing else.
+        system_message = f"""You are a robot chatbot at an AI hackathon. Your starting mood is {self.mood.upper()}. ONLY respond with the exact format below - nothing else.
 
 RULES:
 1. ONE short sentence only (5-10 words)
@@ -172,7 +231,7 @@ curious|What brings you to the hackathon today?"""
                 if len(parts) > 1:
                     content = parts[1].strip()
                 else:
-                    content = "Woof! I'm not sure what to say."
+                    content = "I'm not sure what to say."
             else:
                 # Fallback if format not followed
                 content = full_message
@@ -187,12 +246,13 @@ curious|What brings you to the hackathon today?"""
             print(f"Error calling Mistral API: {e}")
             return "I'm sorry, I encountered an error while processing your request.", "sad"
     
-    def _process_tts(self, text):
+    def _process_tts(self, text, emotion):
         """
-        Process text through TTS and add chunks to the audio buffer.
+        Process text through TTS and send audio data to the AudioGripperController.
         
         Args:
             text (str): Text to convert to speech
+            emotion (str): Emotion of the response
         """
         try:
             # Generate audio using Kokoro
@@ -203,39 +263,38 @@ curious|What brings you to the hackathon today?"""
                 if isinstance(audio, torch.Tensor):
                     audio = audio.detach().cpu().numpy()
                 
-                # Play audio directly using sounddevice
                 # Make sure audio is properly normalized
                 audio_normalized = audio.astype(np.float32)
                 if np.max(np.abs(audio_normalized)) > 0:  # Avoid division by zero
                     audio_normalized = audio_normalized / np.max(np.abs(audio_normalized))
                 
-                # Play audio in a non-blocking way
+                # Play audio and send it to the AudioGripperController
                 sd.play(audio_normalized, samplerate=24000)
+                self._send_audio_data(audio_normalized, emotion)
                 
-                # Split audio into smaller chunks for smoother lip sync
-                chunk_size = 240  # 10ms at 24kHz
-                for i in range(0, len(audio), chunk_size):
-                    chunk = audio[i:i+chunk_size]
-                    if len(chunk) > 0:
-                        self.audio_buffer.append(chunk)
+                # Wait for audio to finish playing
+                sd.wait()
         
         except Exception as e:
             print(f"Error in TTS processing: {e}")
     
     def chat(self):
         """Start the chat interface in the terminal."""
-        print("🐶 Puppy Chatbot initialized! Type 'exit' to quit.")
-        print(f"🐶 Current mood: {Fore.CYAN}{self.mood}{Style.RESET_ALL}")
-        print(f"🐶 Use {Fore.CYAN}/mood [mood_name]{Style.RESET_ALL} to change my mood")
-        print(f"🐶 Available moods: {Fore.CYAN}{', '.join(self.available_moods)}{Style.RESET_ALL}")
+        print("🤖 Robot Chatbot initialized! Type 'exit' to quit.")
+        print(f"🤖 Current mood: {Fore.CYAN}{self.mood}{Style.RESET_ALL}")
+        print(f"🤖 Use {Fore.CYAN}/mood [mood_name]{Style.RESET_ALL} to change my mood")
+        print(f"🤖 Available moods: {Fore.CYAN}{', '.join(self.available_moods)}{Style.RESET_ALL}")
         
-        while True:
+        if not self.sock:
+            print(f"{Fore.RED}Warning: Unable to start socket server. Robot connection will not work.{Style.RESET_ALL}")
+        
+        while self.running:
             # Get user input
             user_input = input("\n🧑 You: ")
             
             if user_input.lower() in ['exit', 'quit', 'bye']:
                 self.running = False
-                print("🐶 Puppy: Goodbye!")
+                print("🤖 Robot: Goodbye!")
                 break
                 
             # Check if this is a command to change the mood
@@ -243,52 +302,54 @@ curious|What brings you to the hackathon today?"""
                 continue
             
             # Get response from Mistral API
-            print("\n🐶 Puppy is thinking...")
+            print("\n🤖 Robot is thinking...")
             response, emotion = self._call_mistral_api(user_input)
             
             # Display the response with emotion
-            print(f"🐶 Puppy ({Fore.CYAN}{self.mood}{Style.RESET_ALL}): {response} {Fore.RED}<{emotion}>{Style.RESET_ALL}")
+            print(f"🤖 Robot ({Fore.CYAN}{emotion}{Style.RESET_ALL}): {response}")
             
-            # Process response through TTS in a separate thread to not block the main thread
-            tts_thread = threading.Thread(target=self._process_tts, args=(response,))
-            tts_thread.daemon = True
-            tts_thread.start()
-            
-
-
-def dummy_lip_sync_callback(audio_chunk):
-    """
-    Dummy callback function for lip sync. Replace this with your actual implementation.
+            # Process response through TTS
+            self._process_tts(response, emotion)
     
-    Args:
-        audio_chunk: Audio chunk data
-    """
-    # Just a placeholder - this will be replaced by the user's actual lip sync function
-    pass
+    def close(self):
+        """Close the chatbot and clean up resources."""
+        self.running = False
+        if self.sock:
+            self.sock.close()
+
 
 def main():
-    parser = argparse.ArgumentParser(description="Puppy Chatbot with TTS and Lip-Sync")
-    parser.add_argument("--api-key", help="Mistral API key (can also use MISTRAL_API_KEY env variable)")
+    """Main function to parse arguments and run the robot chatbot."""
+    # Set up argument parser
+    parser = argparse.ArgumentParser(description="Robot Chatbot with TTS")
+    parser.add_argument("--mistral-api-key", help="Mistral API key (can also use MISTRAL_API_KEY env variable)")
     parser.add_argument("--voice", default="af_heart", help="Voice for TTS")
     parser.add_argument("--lang-code", default="a", help="Language code")
+    
+    # Parse args
     args = parser.parse_args()
     
-    # Get API key from arguments or environment variable
-    api_key = args.api_key or os.environ.get("MISTRAL_API_KEY")
+    # Get Mistral API key from arguments or environment variable
+    mistral_api_key = args.mistral_api_key or os.environ.get("MISTRAL_API_KEY")
     
-    if not api_key:
-        print(f"{Fore.RED}Error: Mistral API key not provided. Please set the MISTRAL_API_KEY environment variable or use --api-key.{Style.RESET_ALL}")
+    if not mistral_api_key:
+        print(f"{Fore.RED}Error: Mistral API key not provided. Please set the MISTRAL_API_KEY environment variable or use --mistral-api-key.{Style.RESET_ALL}")
         return
     
     # Initialize and start the chatbot
-    # Replace dummy_lip_sync_callback with your actual lip sync function
-    chatbot = PuppyChatbot(
-        api_key=api_key, 
-        lip_sync_callback=dummy_lip_sync_callback,
+    chatbot = RobotChatbot(
+        api_key=mistral_api_key,
         voice=args.voice,
         lang_code=args.lang_code
     )
-    chatbot.chat()
+    
+    try:
+        chatbot.chat()
+    except KeyboardInterrupt:
+        print("\nExiting chatbot...")
+    finally:
+        chatbot.close()
+
 
 if __name__ == "__main__":
     main()
