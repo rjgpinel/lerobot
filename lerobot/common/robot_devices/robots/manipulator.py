@@ -29,6 +29,7 @@ import torch
 
 from lerobot.common.robot_devices.cameras.utils import make_cameras_from_configs
 from lerobot.common.robot_devices.motors.utils import MotorsBus, make_motors_buses_from_configs
+from lerobot.common.robot_devices.controllers.utils import make_controller_from_config
 from lerobot.common.robot_devices.robots.configs import ManipulatorRobotConfig
 from lerobot.common.robot_devices.robots.utils import get_arm_id
 from lerobot.common.robot_devices.utils import RobotDeviceAlreadyConnectedError, RobotDeviceNotConnectedError
@@ -164,6 +165,7 @@ class ManipulatorRobot:
         self.leader_arms = make_motors_buses_from_configs(self.config.leader_arms)
         self.follower_arms = make_motors_buses_from_configs(self.config.follower_arms)
         self.cameras = make_cameras_from_configs(self.config.cameras)
+        self.controllers = make_controller_from_config(self.config.controllers)
         self.is_connected = False
         self.logs = {}
 
@@ -442,6 +444,9 @@ class ManipulatorRobot:
             self.follower_arms[name].write("Maximum_Acceleration", 254)
             self.follower_arms[name].write("Acceleration", 254)
 
+    # def _get_controller_command(self) -> dict[int, int]:
+
+
     def teleop_step(
         self, record_data=False
     ) -> None | tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
@@ -450,11 +455,26 @@ class ManipulatorRobot:
                 "ManipulatorRobot is not connected. You need to run `robot.connect()`."
             )
 
-        # Prepare to assign the position of the leader to the follower
+        # Prepare to assign the position fro; the controller or the leader arms to the follower
         leader_pos = {}
+        controller_command = {}
+        if len(self.controllers) != 0:
+            before_controller_read_t = time.perf_counter()
+            for ctrl_name in self.controllers:
+                if "audiogripper" in controller_command:
+                    # if we already have the gripper policy we prefer to erase any command on the same key
+                    controller_command = self.controllers[ctrl_name].get_command() | controller_command
+                else:
+                    # otherwise we prefer to erase what we already have
+                    controller_command = controller_command | self.controllers[ctrl_name].get_command()
+            self.logs["read_controller_pos_dt_s"] = time.perf_counter() - before_controller_read_t
+
         for name in self.leader_arms:
             before_lread_t = time.perf_counter()
             leader_pos[name] = self.leader_arms[name].read("Present_Position")
+            if controller_command:
+                for key in controller_command:
+                    leader_pos[name][key] = controller_command[key]
             leader_pos[name] = torch.from_numpy(leader_pos[name])
             self.logs[f"read_leader_{name}_pos_dt_s"] = time.perf_counter() - before_lread_t
 
@@ -576,6 +596,18 @@ class ManipulatorRobot:
                 "ManipulatorRobot is not connected. You need to run `robot.connect()`."
             )
 
+        controller_command = {}
+        if len(self.controllers) != 0:
+            before_controller_read_t = time.perf_counter()
+            for ctrl_name in self.controllers:
+                if "audiogripper" in controller_command:
+                    # if we already have the gripper policy we prefer to erase any command on the same key
+                    controller_command = self.controllers[ctrl_name].get_command() | controller_command
+                else:
+                    # otherwise we prefer to erase what we already have
+                    controller_command = controller_command | self.controllers[ctrl_name].get_command()
+            self.logs["read_controller_pos_dt_s"] = time.perf_counter() - before_controller_read_t
+        
         from_idx = 0
         to_idx = 0
         action_sent = []
@@ -589,6 +621,9 @@ class ManipulatorRobot:
             # Slower fps expected due to reading from the follower.
             if self.config.max_relative_target is not None:
                 present_pos = self.follower_arms[name].read("Present_Position")
+                if controller_command:
+                    for key in controller_command:
+                        present_pos[key] = controller_command[key]
                 present_pos = torch.from_numpy(present_pos)
                 goal_pos = ensure_safe_goal_position(goal_pos, present_pos, self.config.max_relative_target)
 
