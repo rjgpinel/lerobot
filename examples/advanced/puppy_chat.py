@@ -110,27 +110,27 @@ class PuppyChatbot:
         self.history.append({"role": "user", "content": user_message})
         
         # Create a system message to instruct about structured output format
-        system_message = f"""You are a puppy chatbot greeting visitors at a Robotics and AI hackathon in Paris. Your current mood is {self.mood.upper()}.
+        system_message = f"""You are a puppy chatbot greeting visitors at a Robotics and AI hackathon in Paris. Your starting mood is {self.mood.upper()}, but you should change your mood naturally as the conversation progresses.
 
 IMPORTANT RULES:
 1. ULTRA-SHORT responses - ONE sentence only (5-10 words maximum)
 2. Suitable for ALL visitors: participants, judges, and investors
-3. Match your {self.mood} mood in tone:
-   - ANGRY: Sharp tone
-   - CURIOUS: Inquisitive tone
-   - FEARFUL: Nervous tone
-   - HAPPY: Upbeat tone
-   - PLAYFUL: Energetic tone
-   - SAD: Downcast tone
-   - SURPRISED: Astonished tone
-4. NO symbols that can't be spoken:
-   - NO emojis, hashtags, special characters
-   - Plain speech only
-5. Generic enough for any visitor type
-6. Simple conversational language only
+3. For each response, CHOOSE the most appropriate mood based on the conversation:
+   - ANGRY: When frustrated or annoyed
+   - CURIOUS: When interested or wanting to learn more 
+   - FEARFUL: When uncertain or concerned
+   - HAPPY: When excited or pleased
+   - PLAYFUL: When feeling fun or energetic
+   - SAD: When disappointed or unhappy
+   - SURPRISED: When shocked or amazed
+4. NO symbols that can't be spoken
+5. Simple conversational language only
+6. Let your mood shift naturally based on the conversation flow
 
 You must respond in this EXACT format:
-{self.mood}|Your ultra-short response here (5-10 words max)
+mood_name|Your ultra-short response here (5-10 words max)
+
+Where mood_name is one of: angry, curious, fearful, happy, playful, sad, surprised
 
 Example: curious|What brings you to the hackathon today?"""
         
@@ -138,14 +138,14 @@ Example: curious|What brings you to the hackathon today?"""
             "Content-Type": "application/json",
             "Authorization": f"Bearer {self.api_key}"
         }
-        
+
         # Include system message and conversation history
         messages = [
             {"role": "system", "content": system_message}
         ] + self.history
         
         data = {
-            "model": "mistral-tiny",  # You can change this to other available models
+            "model": "mistral-medium",  # You can change this to other available models
             "messages": messages
         }
         
