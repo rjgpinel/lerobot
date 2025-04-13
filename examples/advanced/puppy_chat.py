@@ -11,6 +11,7 @@ import numpy as np
 import torch
 from colorama import Fore, Style, init
 
+
 class PuppyChatbot:
     def __init__(self, api_key, lip_sync_callback, voice="af_heart", lang_code="a"):
         """
@@ -52,7 +53,36 @@ class PuppyChatbot:
         self.lip_sync_thread = threading.Thread(target=self._lip_sync_worker)
         self.lip_sync_thread.daemon = True
         self.lip_sync_thread.start()
+
+    def _change_mood(self, user_input):
+        """
+        Change the mood of the chatbot.
         
+        Args:
+            user_input (str): User command to change mood
+            
+        Returns:
+            bool: True if mood was changed, False otherwise
+        """
+        # Check if this is a mood change command
+        if not user_input.startswith("/mood "):
+            return False
+            
+        # Extract the requested mood
+        requested_mood = user_input[6:].strip().lower()
+        
+        # Check if it's a valid mood
+        if requested_mood in self.available_moods:
+            old_mood = self.mood
+            self.mood = requested_mood
+            print(f"{Fore.CYAN}🐶 Mood changed from {old_mood} to {self.mood}{Style.RESET_ALL}")
+            return True
+        else:
+            # List available moods
+            moods_list = ", ".join(self.available_moods)
+            print(f"{Fore.YELLOW}Available moods: {moods_list}{Style.RESET_ALL}")
+            return True  # Still handled the command, even if mood didn't change
+
     def _lip_sync_worker(self):
         """Worker thread that calls the lip sync callback every 1ms with new audio data."""
         while self.running:
@@ -63,36 +93,7 @@ class PuppyChatbot:
                 self.lip_sync_callback(audio_chunk)
             # Sleep for 1ms
             time.sleep(0.001)
-
-    def _change_mood(self, user_input):
-            """
-            Change the mood of the chatbot.
-            
-            Args:
-                user_input (str): User command to change mood
-                
-            Returns:
-                bool: True if mood was changed, False otherwise
-            """
-            # Check if this is a mood change command
-            if not user_input.startswith("/mood "):
-                return False
-                
-            # Extract the requested mood
-            requested_mood = user_input[6:].strip().lower()
-            
-            # Check if it's a valid mood
-            if requested_mood in self.available_moods:
-                old_mood = self.mood
-                self.mood = requested_mood
-                print(f"{Fore.CYAN}🐶 Mood changed from {old_mood} to {self.mood}{Style.RESET_ALL}")
-                return True
-            else:
-                # List available moods
-                moods_list = ", ".join(self.available_moods)
-                print(f"{Fore.YELLOW}Available moods: {moods_list}{Style.RESET_ALL}")
-                return True  # Still handled the command, even if mood didn't change
-
+    
     def _call_mistral_api(self, user_message):
         """
         Call the Mistral API with the user message and conversation history.
@@ -110,42 +111,40 @@ class PuppyChatbot:
         self.history.append({"role": "user", "content": user_message})
         
         # Create a system message to instruct about structured output format
-        system_message = f"""You are a puppy chatbot greeting visitors at a Robotics and AI hackathon in Paris. Your current mood is {self.mood.upper()}.
+        system_message = f"""You are a puppy chatbot at an AI hackathon. Your starting mood is {self.mood.upper()}. ONLY respond with the exact format below - nothing else.
 
-IMPORTANT RULES:
-1. ULTRA-SHORT responses - ONE sentence only (5-10 words maximum)
-2. Suitable for ALL visitors: participants, judges, and investors
-3. Match your {self.mood} mood in tone:
-   - ANGRY: Sharp tone
-   - CURIOUS: Inquisitive tone
-   - FEARFUL: Nervous tone
-   - HAPPY: Upbeat tone
-   - PLAYFUL: Energetic tone
-   - SAD: Downcast tone
-   - SURPRISED: Astonished tone
-4. NO symbols that can't be spoken:
-   - NO emojis, hashtags, special characters
-   - Plain speech only
-5. Generic enough for any visitor type
-6. Simple conversational language only
+RULES:
+1. ONE short sentence only (5-10 words)
+2. NO explanations or meta-commentary
+3. NO format notes or descriptions
+4. ONLY respond with the exact format below
+5. Choose an appropriate mood for each response:
+   - angry: When frustrated
+   - curious: When interested
+   - fearful: When uncertain
+   - happy: When pleased
+   - playful: When fun
+   - sad: When unhappy
+   - surprised: When amazed
 
-You must respond in this EXACT format:
-{self.mood}|Your ultra-short response here (5-10 words max)
+RESPOND EXACTLY LIKE THIS:
+mood_name|Your brief response (5-10 words)
 
-Example: curious|What brings you to the hackathon today?"""
+Example of ENTIRE response: 
+curious|What brings you to the hackathon today?"""
         
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {self.api_key}"
         }
-        
+
         # Include system message and conversation history
         messages = [
             {"role": "system", "content": system_message}
         ] + self.history
         
         data = {
-            "model": "mistral-tiny",  # You can change this to other available models
+            "model": "mistral-small",  # Using a more capable model
             "messages": messages
         }
         
@@ -161,10 +160,13 @@ Example: curious|What brings you to the hackathon today?"""
                 parts = full_message.split("|", 1)
                 emotion = parts[0].strip().lower()
                 
-                # Ensure valid emotion (use the current mood as fallback)
+                # Ensure valid emotion
                 valid_emotions = self.available_moods
                 if emotion not in valid_emotions:
                     emotion = self.mood  # Default to current mood if parsing fails
+                else:
+                    # Update the chatbot's current mood to match the response emotion
+                    self.mood = emotion
                 
                 # Get the response content
                 if len(parts) > 1:
