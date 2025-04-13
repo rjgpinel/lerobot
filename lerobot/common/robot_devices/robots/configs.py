@@ -28,6 +28,10 @@ from lerobot.common.robot_devices.motors.configs import (
     FeetechMotorsBusConfig,
     MotorsBusConfig,
 )
+from lerobot.common.robot_devices.controllers.configs import (
+    AudioGripperControllerConfig,
+    ControllerConfig,
+)
 
 
 @dataclass
@@ -43,6 +47,7 @@ class ManipulatorRobotConfig(RobotConfig):
     leader_arms: dict[str, MotorsBusConfig] = field(default_factory=lambda: {})
     follower_arms: dict[str, MotorsBusConfig] = field(default_factory=lambda: {})
     cameras: dict[str, CameraConfig] = field(default_factory=lambda: {})
+    controllers: dict[str, ControllerConfig] = field(default_factory=lambda: {})
 
     # Optionally limit the magnitude of the relative positional target vector for safety purposes.
     # Set this to a positive scalar to have the same value for all motors, or a list that is the same length
@@ -488,6 +493,15 @@ class So100RobotConfig(ManipulatorRobotConfig):
                 width=640,
                 height=480,
             ),
+        }
+    )
+
+    controllers: dict[str, ControllerConfig] = field(
+        default_factory=lambda: {
+            "audiogripper": AudioGripperControllerConfig(
+                motor_id=5,
+                initial_position=0
+            )
         }
     )
 
