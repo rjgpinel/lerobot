@@ -65,6 +65,7 @@ class RobotChatbot:
         
         # Create socket server
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
             self.sock.bind((HOST, PORT))
             self.sock.listen()
@@ -362,7 +363,7 @@ def main():
     # Set up argument parser
     parser = argparse.ArgumentParser(description="Robot Chatbot with TTS")
     parser.add_argument("--mistral-api-key", help="Mistral API key (can also use MISTRAL_API_KEY env variable)")
-    parser.add_argument("--voice", default="af_heart", help="Voice for TTS")
+    parser.add_argument("--voice", default="am_fenrir", help="Voice for TTS")
     parser.add_argument("--lang-code", default="a", help="Language code")
     
     # Parse args
