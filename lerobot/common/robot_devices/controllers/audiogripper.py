@@ -216,26 +216,51 @@ class AudioGripperController:
                 
             self.last_process_time = current_time
             
+            # Log input data for debugging
+            audio_min = np.min(audio_data)
+            audio_max = np.max(audio_data)
+            audio_abs_max = max(abs(audio_min), abs(audio_max))
+            logging.debug(f"Audio data shape: {audio_data.shape}, min: {audio_min:.2e}, max: {audio_max:.2e}, abs max: {audio_abs_max:.2e}")
+            
             # Get the emotion modifier
             emotion_mod = EMOTION_INTENSITY.get(emotion, 1.0)
             
             # Calculate RMS energy directly (direct equivalent of librosa.feature.rms)
             rms = np.sqrt(np.mean(np.square(audio_data)))
+            logging.debug(f"Raw RMS value: {rms:.6f}")
             
-            # Apply a minimum threshold to filter out background noise
-            if rms < 0.02:  # Adjust threshold as needed
-                rms = 0
+            # Normalize RMS based on audio characteristics
+            # Fixed lower and upper bounds based on expected audio levels
+            MIN_MOUTH_RMS = 0.05     # Minimum RMS that should start moving the mouth
+            MAX_MOUTH_RMS = 0.30     # RMS value that corresponds to fully open mouth
             
-            # Normalize and apply emotion modifier
-            # Boost small values to make movements more pronounced
-            normalized_value = min(rms / 0.2, 1.0)  # 0.2 is a reasonable maximum RMS
-            mouth_value = np.power(normalized_value, 0.7) * emotion_mod
+            # Scale RMS based on observed values (from debug output)
+            # Your example showed tiny values, so we scale up appropriately
+            if audio_abs_max < 1e-5:  # For tiny values like those in debug output
+                scaled_rms = rms * 1e7
+            else:
+                # For larger values, we might not need as much scaling
+                scaled_rms = rms
+                
+            logging.debug(f"Scaled RMS: {scaled_rms:.6f}")
+            
+            # Apply lower threshold - no movement below this
+            if scaled_rms < MIN_MOUTH_RMS:
+                mouth_value = 0.0
+            else:
+                # Map to 0-1 range with proper bounds
+                normalized_value = (scaled_rms - MIN_MOUTH_RMS) / (MAX_MOUTH_RMS - MIN_MOUTH_RMS)
+                # Clamp to 0-1 range
+                normalized_value = max(0.0, min(normalized_value, 1.0))
+                # Apply power curve to make movement more natural
+                mouth_value = np.power(normalized_value, 0.6) * emotion_mod
+                # Ensure we don't exceed 1.0 after applying emotion modifier
+                mouth_value = min(mouth_value, 1.0)
+            
+            logging.debug(f"Final mouth value: {mouth_value:.4f}")
             
             # Update the current position directly using the function that works for default audio
             self._update_current_position(mouth_value) 
-            
-            # For debugging
-            logging.debug(f"Live audio RMS: {rms:.4f}, Mouth value: {mouth_value:.4f}")
             
         except Exception as e:
             logging.error(f"Error processing live audio: {e}")
