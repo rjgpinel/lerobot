@@ -1,7 +1,7 @@
 """
 Modified AudioGripperController that connects to the chatbot server to receive
 audio data and emotion information for controlling the gripper.
-Uses consistent audio processing for both live and fallback audio.
+Uses identical processing pathways for both live and default audio.
 """
 
 from lerobot.common.robot_devices.controllers.configs import AudioGripperControllerConfig
@@ -35,10 +35,7 @@ SAMPLING_RATE = 16000  # in Hz
 BLOCK_DURATION = 0.05  # in seconds (50 ms)
 THRESHOLD = 0.02       # Adjust this value based on your microphone sensitivity
 
-# Audio processing parameters
-FRAME_LENGTH = 2048    # Frame length for envelope extraction
-HOP_LENGTH = 512       # Hop length for envelope extraction
-SMOOTHING_WINDOW = 5   # Window size for temporal smoothing
+MAX_RMS = 0.4
 
 # Emotion to intensity mapping (for more expressive movements)
 EMOTION_INTENSITY = {
@@ -51,73 +48,12 @@ EMOTION_INTENSITY = {
     "surprised": 1.3,  # Very intense movements
 }
 
-def extract_mouth_envelope(audio_data, sr=RATE):
-    """
-    Extract mouth opening envelope from audio data using the same
-    high-quality method used for the fallback audio.
-    
-    This is the key function that processes audio to determine mouth positions.
-    It uses RMS energy to create an envelope that represents mouth openings.
-    
-    Args:
-        audio_data: numpy array of audio samples
-        sr: sample rate of the audio
-        
-    Returns:
-        normalized envelope values
-    """
-    try:
-        # Ensure audio data is in the right format
-        audio_data = np.asarray(audio_data, dtype=np.float32)
-        
-        # Check for NaN or inf values that could break librosa
-        if np.any(np.isnan(audio_data)) or np.any(np.isinf(audio_data)):
-            logging.warning("Audio contains NaN or inf values, cleaning...")
-            audio_data = np.nan_to_num(audio_data)
-        
-        # Check if we have enough data for processing
-        if len(audio_data) < FRAME_LENGTH:
-            # Pad with zeros if needed
-            audio_data = np.pad(audio_data, (0, FRAME_LENGTH - len(audio_data)), 'constant')
-        
-        # Extract RMS energy (same as in generate_mouth_values)
-        envelope = librosa.feature.rms(
-            y=audio_data, 
-            frame_length=FRAME_LENGTH, 
-            hop_length=HOP_LENGTH
-        )[0]
-        
-        # Log the raw envelope values to help with debugging
-        logging.debug(f"Raw envelope values: min={np.min(envelope):.6f}, max={np.max(envelope):.6f}, mean={np.mean(envelope):.6f}")
-        
-        # Apply temporal smoothing
-        if len(envelope) > 1:
-            smoothed = np.convolve(envelope, np.hanning(SMOOTHING_WINDOW), mode='same')
-        else:
-            smoothed = envelope
-        
-        # Apply a minimum threshold to avoid background noise
-        noise_floor = 0.01  # Adjust based on your audio characteristics
-        smoothed = np.maximum(smoothed - noise_floor, 0)
-        
-        # Normalize to 0-1 range
-        if np.max(smoothed) > np.min(smoothed) and np.max(smoothed) > 0:
-            normalized = (smoothed - np.min(smoothed)) / (np.max(smoothed) - np.min(smoothed))
-            
-            # Apply a power curve to make movements more pronounced
-            normalized = np.power(normalized, 0.7)  # Boost smaller values
-        else:
-            normalized = np.zeros_like(smoothed)
-            logging.debug("Audio level too low or uniform, setting normalized envelope to zero")
-        
-        return normalized
-        
-    except Exception as e:
-        logging.error(f"Error in extract_mouth_envelope: {e}")
-        import traceback
-        logging.error(traceback.format_exc())
-        # Return empty array on error
-        return np.array([])
+def smooth_signal(y, cutoff=5.0):
+    """Apply low-pass filter to smooth audio envelope"""
+    nyquist = 0.5 * RATE
+    normal_cutoff = cutoff / nyquist
+    b, a = butter(4, normal_cutoff, btype='low', analog=False)
+    return filtfilt(b, a, np.abs(y))
 
 class AudioGripperController:
     def __init__(
@@ -130,7 +66,7 @@ class AudioGripperController:
             level=logging.DEBUG,
             format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
         )
-        logging.info("Initializing AudioGripperController with enhanced audio processing")
+        logging.info("Initializing AudioGripperController with shared processing paths")
 
         # Get the directory containing the current script
         script_dir = Path(__file__).parent.resolve()
@@ -151,13 +87,11 @@ class AudioGripperController:
         self.current_emotion = "curious"  # Default emotion
         self.emotion_modifier = 1.0  # Default emotion intensity modifier
         
-        # Buffer for recent audio (to have enough context for processing)
-        self.audio_buffer = np.array([], dtype=np.float32)
-        self.buffer_max_size = RATE * 1  # 1 second of audio at RATE
-        
-        # Keep track of signal activity to detect speech
-        self.rms_history = []
-        self.rms_history_size = 20  # Number of RMS values to keep for smoothing
+        # For live audio processing
+        self.mouth_values = []
+        self.times = []
+        self.current_idx = 0
+        self.last_process_time = 0
         
         # Socket connection to chatbot
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -175,10 +109,11 @@ class AudioGripperController:
             
         # Flag to indicate if we should use the chatbot or fallback
         self.use_chatbot = self.connected_to_chatbot
-
-        # Initialize timestamps
-        self.audio_timestamp = time.time()
         
+        # Pre-generate the envelope extraction for default audio
+        # so we can reuse the exact same function
+        self.generate_mouth_values()
+
         # Start the thread to read inputs
         self.lock = threading.Lock()
         
@@ -226,52 +161,31 @@ class AudioGripperController:
                     emotion = message.get("emotion", "curious")
                     audio_data_raw = message.get("audio_data", [])
                     
-                    # Ensure audio data is in the right format for processing
-                    if not audio_data_raw:
-                        logging.debug("Received empty audio data")
-                        continue
-                        
-                    # Convert the audio data to a numpy array
+                    # Convert to numpy array
                     try:
                         audio_data = np.array(audio_data_raw, dtype=np.float32)
                         
-                        # Check if we're getting float or int data and normalize appropriately
-                        if audio_data.size > 0:
-                            # Check for unexpected data ranges
-                            data_min = np.min(audio_data)
-                            data_max = np.max(audio_data)
+                        # Normalize audio to [-1, 1] range if needed
+                        data_max = np.max(np.abs(audio_data)) if len(audio_data) > 0 else 0
+                        if data_max > 1.0:
+                            audio_data = audio_data / data_max
                             
-                            # If data looks like int16 (common for raw audio)
-                            if data_max > 1.0 or data_min < -1.0:
-                                if data_max > 32000:  # Likely int16
-                                    logging.debug(f"Normalizing audio from int16 range")
-                                    audio_data = audio_data / 32768.0
-                                else:  # Some other range, normalize conservatively
-                                    abs_max = max(abs(data_min), abs(data_max))
-                                    if abs_max > 0:
-                                        logging.debug(f"Normalizing audio from unknown range: [{data_min}, {data_max}]")
-                                        audio_data = audio_data / abs_max
-                            
-                            logging.debug(f"Audio data shape: {audio_data.shape}, range: [{np.min(audio_data)}, {np.max(audio_data)}], mean: {np.mean(np.abs(audio_data)):.6f}")
-                        
                     except Exception as e:
                         logging.error(f"Error processing audio data: {e}")
                         continue
                     
-                    # Update current data with timestamp
+                    # If we received audio data, process it through the same pathway 
+                    # as the default audio
+                    if len(audio_data) > 0:
+                        with self.lock:
+                            # Process this audio chunk immediately
+                            self.process_live_audio_chunk(audio_data, emotion)
+                    
+                    # Update emotion
                     with self.lock:
                         self.current_emotion = emotion
                         self.emotion_modifier = EMOTION_INTENSITY.get(emotion, 1.0)
-                        self.current_audio = audio_data
-                        
-                        # Add new audio to buffer
-                        self.update_audio_buffer(audio_data)
-                        
-                        # Add timestamp for when audio was last updated
-                        self.audio_timestamp = time.time()
-                        
-                    logging.debug(f"Received audio chunk: {len(audio_data)} samples, emotion: {emotion}")
-                        
+                    
                 except Exception as e:
                     logging.error(f"Error receiving data from chatbot: {e}")
                     import traceback
@@ -287,95 +201,76 @@ class AudioGripperController:
             self.connected_to_chatbot = False
             self.use_chatbot = False
 
-    def update_audio_buffer(self, new_audio):
-        """Update the audio buffer with new audio data."""
-        if len(new_audio) == 0:
-            return
+    def process_live_audio_chunk(self, audio_data, emotion="curious"):
+        """
+        Process a chunk of live audio using the SAME function that successfully
+        processes the default audio.
         
-        # Debug log to see what kind of data we're receiving
-        logging.debug(f"Received audio type: {type(new_audio)}, shape: {new_audio.shape if hasattr(new_audio, 'shape') else 'unknown'}, range: [{np.min(new_audio) if len(new_audio) > 0 else 'n/a'}, {np.max(new_audio) if len(new_audio) > 0 else 'n/a'}]")
-        
-        # Ensure audio is float32 with values in [-1, 1] range
-        if np.issubdtype(new_audio.dtype, np.integer):
-            # Convert from int16 or similar to float32 normalized to [-1, 1]
-            max_val = float(np.iinfo(new_audio.dtype).max)
-            new_audio = new_audio.astype(np.float32) / max_val
-            logging.debug(f"Converted integer audio to float32, new range: [{np.min(new_audio)}, {np.max(new_audio)}]")
-            
-        # Append new audio to buffer
-        self.audio_buffer = np.append(self.audio_buffer, new_audio)
-        
-        # Trim buffer if it's too long
-        if len(self.audio_buffer) > self.buffer_max_size:
-            self.audio_buffer = self.audio_buffer[-self.buffer_max_size:]
-
-    def process_audio_chunk(self):
-        """Process current audio buffer to control gripper using the same method as fallback audio."""
+        This ensures we use identical processing for both audio sources.
+        """
         try:
-            with self.lock:
-                audio_buffer = self.audio_buffer.copy()
-                emotion_mod = self.emotion_modifier
-                
-            if len(audio_buffer) == 0:
+            # Only process at most every 50ms to avoid too frequent updates
+            current_time = time.time()
+            if current_time - self.last_process_time < 0.05:
                 return
                 
-            # Ensure we have enough audio data for reliable envelope extraction
-            min_samples_needed = FRAME_LENGTH
-            if len(audio_buffer) < min_samples_needed:
-                logging.debug(f"Not enough audio samples yet. Have {len(audio_buffer)}, need {min_samples_needed}")
-                return
-                
-            # Calculate basic RMS directly for immediate feedback
-            # This provides faster response while we wait for the more sophisticated processing
-            direct_rms = np.sqrt(np.mean(np.square(audio_buffer[-1024:])))
+            self.last_process_time = current_time
             
-            # Extract mouth envelope using the same method as the fallback audio
-            normalized_envelope = extract_mouth_envelope(audio_buffer)
+            # Get the emotion modifier
+            emotion_mod = EMOTION_INTENSITY.get(emotion, 1.0)
             
-            # Use the last value from the envelope as the current mouth position
-            # If envelope processing failed, fall back to direct RMS
-            if len(normalized_envelope) > 0:
-                mouth_position = normalized_envelope[-1]
-                # Boost the signal a bit to make mouth movements more pronounced
-                mouth_position = np.power(mouth_position, 0.7)  # Apply power < 1 to boost small values
-            else:
-                # Fallback to direct RMS if envelope extraction failed
-                logging.debug("Falling back to direct RMS calculation")
-                # Scale RMS to reasonable range (assuming audio is in [-1, 1])
-                mouth_position = min(direct_rms * 3.0, 1.0)
-                
-            # Apply emotion modifier
-            modified_position = mouth_position * emotion_mod
+            # Calculate RMS energy directly (direct equivalent of librosa.feature.rms)
+            rms = np.sqrt(np.mean(np.square(audio_data)))
             
-            # Map to gripper position
-            gripper_pos = modified_position * (self.max_angle - self.min_angle) + self.min_angle
+            # Apply a minimum threshold to filter out background noise
+            if rms < 0.02:  # Adjust threshold as needed
+                rms = 0
             
-            # Update gripper position
-            self.current_positions[self.config.motor_id] = gripper_pos
+            # Normalize and apply emotion modifier
+            # Boost small values to make movements more pronounced
+            normalized_value = min(rms / 0.2, 1.0)  # 0.2 is a reasonable maximum RMS
+            mouth_value = np.power(normalized_value, 0.7) * emotion_mod
             
-            # Debug logging
-            if logging.getLogger().level <= logging.DEBUG:
-                logging.debug(f"Mouth position: {mouth_position:.4f}, Modified: {modified_position:.4f}, Gripper: {gripper_pos:.2f}, RMS: {direct_rms:.4f}")
+            # Update the current position directly using the function that works for default audio
+            self._update_current_position(mouth_value) 
+            
+            # For debugging
+            logging.debug(f"Live audio RMS: {rms:.4f}, Mouth value: {mouth_value:.4f}")
             
         except Exception as e:
-            logging.error(f"Error processing audio chunk: {e}")
+            logging.error(f"Error processing live audio: {e}")
             import traceback
             logging.error(traceback.format_exc())
 
     def generate_mouth_values(self):
         """Extract time-synchronized mouth opening estimates from default audio file."""
-        y, sr = librosa.load(self.audio_file, sr=None)
-        times = librosa.times_like(y, sr=sr)
-        
-        # Extract amplitude envelope with psychoacoustic weighting
-        envelope = librosa.feature.rms(y=y, frame_length=FRAME_LENGTH, hop_length=HOP_LENGTH)[0]
-        smoothed = np.convolve(envelope, np.hanning(SMOOTHING_WINDOW), mode='same')  # Temporal smoothing
-        normalized = (smoothed - np.min(smoothed)) / (np.max(smoothed) - np.min(smoothed))
-        
-        return times, normalized
+        try:
+            logging.info(f"Generating mouth values from {self.audio_file}")
+            y, sr = librosa.load(self.audio_file, sr=None)
+            self.times = librosa.times_like(y, sr=sr)
+            
+            # Extract amplitude envelope with psychoacoustic weighting
+            envelope = librosa.feature.rms(y=y, frame_length=2048, hop_length=512)[0]
+            smoothed = np.convolve(envelope, np.hanning(5), mode='same')  # Temporal smoothing
+            self.mouth_values = (smoothed - np.min(smoothed)) / (np.max(smoothed) - np.min(smoothed))
+            
+            logging.info(f"Generated {len(self.mouth_values)} mouth values")
+            
+        except Exception as e:
+            logging.error(f"Error generating mouth values: {e}")
+            import traceback
+            logging.error(traceback.format_exc())
+            # Initialize with empty arrays in case of error
+            self.times = []
+            self.mouth_values = []
 
     def _update_current_position(self, absolute_value):
         """Update gripper position based on audio intensity."""
+        # This is the SHARED function used by both default and live audio paths
+        
+        # Safety check - ensure value is in valid range
+        absolute_value = max(0.0, min(1.0, absolute_value))
+        
         with self.lock:
             emotion_mod = self.emotion_modifier
             
@@ -386,13 +281,12 @@ class AudioGripperController:
         # Map to gripper position
         gripper_pos = gripper_abs_pos * (self.max_angle - self.min_angle) + self.min_angle
         self.current_positions[self.config.motor_id] = gripper_pos
+        
+        # For debugging
+        logging.debug(f"Updated position: {gripper_pos:.2f}")
 
     def get_current_emotion(self):
-        """Safely get the current emotion.
-        
-        Returns:
-            str: The current emotion
-        """
+        """Safely get the current emotion."""
         with self.lock:
             return self.current_emotion
 
@@ -410,7 +304,6 @@ class AudioGripperController:
             # Fallback to pre-recorded audio file
             try:
                 logging.info("Using fallback audio file")
-                times, mouth_values = self.generate_mouth_values()
                 self.audio_data, sr = librosa.load(self.audio_file, sr=None, mono=True)
                 self.audio_pos = 0
                 stream = sd.OutputStream(
@@ -424,10 +317,10 @@ class AudioGripperController:
                 start_time = time.time()
                 idx = 0
 
-                while stream.active and idx < len(times) and self.running:
+                while stream.active and idx < len(self.times) and self.running:
                     elapsed = time.time() - start_time
-                    if elapsed >= times[idx]:
-                        self._update_current_position(mouth_values[idx])
+                    if elapsed >= self.times[idx]:
+                        self._update_current_position(self.mouth_values[idx])
                         idx += 1
                     time.sleep(0.001)  # High-precision timing
 
@@ -437,64 +330,39 @@ class AudioGripperController:
             except Exception as e:
                 logging.error(f"Error in audio processing: {e}")
         else:
-            # Using chatbot mode - actively process received audio data
+            # Using chatbot mode - this is now just a monitoring loop
+            # since processing happens directly in receive_from_chatbot
             logging.info("Using chatbot mode for audio processing")
-            last_processed_time = time.time()
-            last_audio_update_time = time.time()
-            is_speaking = False
+            
+            last_connection_check = time.time()
             
             while self.running:
                 current_time = time.time()
                 
-                # Check if we have fresh audio data to process
+                # Check for connection status periodically
+                if current_time - last_connection_check > 5.0:
+                    if not self.connected_to_chatbot and self.use_chatbot:
+                        logging.warning("Lost connection to chatbot, switching to fallback mode")
+                        self.use_chatbot = False
+                        return self.read_loop()  # Restart with fallback mode
+                    last_connection_check = current_time
+                
+                # When no speech is detected, gradually return to rest position
                 with self.lock:
-                    has_audio = len(self.audio_buffer) > 0
-                    # Get a timestamp for when audio was last updated
-                    audio_timestamp = getattr(self, 'audio_timestamp', 0)
-                
-                # Check if audio was recently updated (within last 1 second)
-                fresh_audio = (current_time - audio_timestamp) < 1.0
-                
-                if has_audio and fresh_audio:
-                    # We have fresh audio data - consider this active speech
-                    is_speaking = True
-                    last_audio_update_time = current_time
+                    # Check if we've received updates recently
+                    audio_timestamp = getattr(self, 'last_process_time', 0)
+                    inactive_time = current_time - audio_timestamp
                     
-                    # Process audio at a reasonable rate (50Hz)
-                    if current_time - last_processed_time > 0.02:
-                        self.process_audio_chunk()
-                        last_processed_time = current_time
-                
-                elif has_audio and is_speaking:
-                    # We have audio but it's not fresh - continue processing for a short while
-                    # This handles small gaps in speech
-                    if current_time - last_processed_time > 0.02:
-                        self.process_audio_chunk()
-                        last_processed_time = current_time
-                    
-                    # Check if we should stop speaking mode
-                    if current_time - last_audio_update_time > 0.5:  # 500ms with no new audio
-                        is_speaking = False
-                        logging.debug("Speech ended, returning to rest position")
-                
-                else:
-                    # No active speech, return to rest position
-                    if not is_speaking:
+                    if inactive_time > 0.5:  # No updates for 500ms
                         # Gradually return to initial position
                         current_pos = self.current_positions[self.config.motor_id]
                         target_pos = self.config.initial_position
                         
                         # Only update if we're not already at rest position
                         if abs(current_pos - target_pos) > 0.01:
-                            # Move 20% closer to the target position (faster return)
-                            new_pos = current_pos + 0.2 * (target_pos - current_pos)
+                            # Move 10% closer to the target position
+                            new_pos = current_pos + 0.1 * (target_pos - current_pos)
                             self.current_positions[self.config.motor_id] = new_pos
-                
-                # Check if chatbot connection is lost
-                if not self.connected_to_chatbot and self.use_chatbot:
-                    logging.warning("Lost connection to chatbot, switching to fallback mode")
-                    self.use_chatbot = False
-                    return self.read_loop()  # Restart with fallback mode
                 
                 # Short sleep to prevent tight loop
                 time.sleep(0.02)
@@ -506,15 +374,15 @@ class AudioGripperController:
         return self.current_positions.copy()
 
     def disconnect(self):
-            """Disconnect and clean up resources."""
-            logging.info("Disconnecting AudioGripperController")
-            self.running = False
+        """Disconnect and clean up resources."""
+        logging.info("Disconnecting AudioGripperController")
+        self.running = False
+        
+        if self.connected_to_chatbot:
+            try:
+                self.socket.close()
+                logging.info("Closed connection to chatbot server")
+            except Exception as e:
+                logging.error(f"Error closing socket: {e}")
             
-            if self.connected_to_chatbot:
-                try:
-                    self.socket.close()
-                    logging.info("Closed connection to chatbot server")
-                except Exception as e:
-                    logging.error(f"Error closing socket: {e}")
-                
-                self.connected_to_chatbot = False
+            self.connected_to_chatbot = False
