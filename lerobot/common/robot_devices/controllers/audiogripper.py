@@ -143,14 +143,15 @@ class AudioGripperController:
                     emotion = message.get("emotion", "curious")
                     audio_data = np.array(message.get("audio_data", []))
                     
-                    # Update current data
+                    # Update current data with timestamp
                     with self.lock:
                         self.current_emotion = emotion
                         self.emotion_modifier = EMOTION_INTENSITY.get(emotion, 1.0)
                         self.current_audio = audio_data
+                        # Add timestamp for when audio was last updated
+                        self.audio_timestamp = time.time()
                         
-                    # Process audio immediately
-                    self.process_audio_chunk()
+                    logging.debug(f"Received audio chunk: {len(audio_data)} samples, emotion: {emotion}")
                         
                 except Exception as e:
                     logging.error(f"Error receiving data from chatbot: {e}")
@@ -176,17 +177,35 @@ class AudioGripperController:
             # Calculate RMS of the audio chunk
             rms = np.sqrt(np.mean(np.square(audio)))
             
+            # Apply a minimum threshold to avoid tiny movements
+            if rms < 0.01:
+                rms = 0
+                
             # Apply basic intensity modification
             modified_rms = rms * emotion_mod
             
-            # Normalize and clamp to 0-1 range
-            normalized_intensity = max(min(modified_rms / MAX_RMS, 1.0), 0.0)
+            # Amplify the signal (make movement more pronounced)
+            amplified_rms = modified_rms * 1.5
             
-            # Map to gripper position
-            gripper_pos = normalized_intensity * (self.max_angle - self.min_angle) + self.min_angle
+            # Normalize and clamp to 0-1 range
+            normalized_intensity = max(min(amplified_rms / MAX_RMS, 1.0), 0.0)
+            
+            # Map to gripper position with a minimum movement threshold
+            if normalized_intensity < 0.05:
+                # Below threshold, go to rest position
+                gripper_pos = self.min_angle
+            else:
+                # Above threshold, map to position range
+                # Use a non-linear mapping to make small sounds more visible
+                adjusted_intensity = normalized_intensity ** 0.7  # Power less than 1 amplifies small values
+                gripper_pos = adjusted_intensity * (self.max_angle - self.min_angle) + self.min_angle
             
             # Update gripper position
             self.current_positions[self.config.motor_id] = gripper_pos
+            
+            # Debug logging
+            if logging.getLogger().level <= logging.DEBUG:
+                logging.debug(f"Audio RMS: {rms:.4f}, Position: {gripper_pos:.2f}")
             
         except Exception as e:
             logging.error(f"Error processing audio chunk: {e}")
@@ -269,32 +288,55 @@ class AudioGripperController:
             # Using chatbot mode - actively process received audio data
             logging.info("Using chatbot mode for audio processing")
             last_processed_time = time.time()
-            no_audio_counter = 0
+            last_audio_update_time = time.time()
+            is_speaking = False
             
             while self.running:
                 current_time = time.time()
                 
-                # Check if we have audio data to process
+                # Check if we have fresh audio data to process
                 with self.lock:
                     has_audio = self.current_audio is not None and len(self.current_audio) > 0
+                    # Get a timestamp for when audio was last updated
+                    audio_timestamp = getattr(self, 'audio_timestamp', 0)
                 
-                if has_audio:
-                    # Process the current audio chunk again if it's been a while since last processing
-                    # This ensures continuous movement even if audio chunks arrive slowly
-                    if current_time - last_processed_time > 0.02:  # 50Hz update rate
+                # Check if audio was recently updated (within last 1 second)
+                fresh_audio = (current_time - audio_timestamp) < 1.0
+                
+                if has_audio and fresh_audio:
+                    # We have fresh audio data - consider this active speech
+                    is_speaking = True
+                    last_audio_update_time = current_time
+                    
+                    # Process audio at a reasonable rate (50Hz)
+                    if current_time - last_processed_time > 0.02:
                         self.process_audio_chunk()
                         last_processed_time = current_time
-                        no_audio_counter = 0
+                
+                elif has_audio and is_speaking:
+                    # We have audio but it's not fresh - continue processing for a short while
+                    # This handles small gaps in speech
+                    if current_time - last_processed_time > 0.02:
+                        self.process_audio_chunk()
+                        last_processed_time = current_time
+                    
+                    # Check if we should stop speaking mode
+                    if current_time - last_audio_update_time > 0.5:  # 500ms with no new audio
+                        is_speaking = False
+                        logging.debug("Speech ended, returning to rest position")
+                
                 else:
-                    # If no audio for a while, gradually return to rest position
-                    no_audio_counter += 1
-                    if no_audio_counter > 25:  # After ~0.5 seconds of no audio
+                    # No active speech, return to rest position
+                    if not is_speaking:
                         # Gradually return to initial position
                         current_pos = self.current_positions[self.config.motor_id]
                         target_pos = self.config.initial_position
-                        # Move 10% closer to the target position
-                        new_pos = current_pos + 0.1 * (target_pos - current_pos)
-                        self.current_positions[self.config.motor_id] = new_pos
+                        
+                        # Only update if we're not already at rest position
+                        if abs(current_pos - target_pos) > 0.01:
+                            # Move 20% closer to the target position (faster return)
+                            new_pos = current_pos + 0.2 * (target_pos - current_pos)
+                            self.current_positions[self.config.motor_id] = new_pos
                 
                 # Check if chatbot connection is lost
                 if not self.connected_to_chatbot and self.use_chatbot:
