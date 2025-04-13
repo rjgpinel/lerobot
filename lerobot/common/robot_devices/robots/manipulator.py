@@ -444,6 +444,9 @@ class ManipulatorRobot:
             self.follower_arms[name].write("Maximum_Acceleration", 254)
             self.follower_arms[name].write("Acceleration", 254)
 
+    # def _get_controller_command(self) -> dict[int, int]:
+
+
     def teleop_step(
         self, record_data=False
     ) -> None | tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
@@ -458,7 +461,12 @@ class ManipulatorRobot:
         if len(self.controllers) != 0:
             before_controller_read_t = time.perf_counter()
             for ctrl_name in self.controllers:
-                controller_command = self.controllers[ctrl_name].get_command()
+                if "audiogripper" in controller_command:
+                    # if we already have the gripper policy we prefer to erase any command on the same key
+                    controller_command = self.controllers[ctrl_name].get_command() | controller_command
+                else:
+                    # otherwise we prefer to erase what we already have
+                    controller_command = controller_command | self.controllers[ctrl_name].get_command()
             self.logs["read_controller_pos_dt_s"] = time.perf_counter() - before_controller_read_t
 
         for name in self.leader_arms:
@@ -592,7 +600,12 @@ class ManipulatorRobot:
         if len(self.controllers) != 0:
             before_controller_read_t = time.perf_counter()
             for ctrl_name in self.controllers:
-                controller_command = self.controllers[ctrl_name].get_command()
+                if "audiogripper" in controller_command:
+                    # if we already have the gripper policy we prefer to erase any command on the same key
+                    controller_command = self.controllers[ctrl_name].get_command() | controller_command
+                else:
+                    # otherwise we prefer to erase what we already have
+                    controller_command = controller_command | self.controllers[ctrl_name].get_command()
             self.logs["read_controller_pos_dt_s"] = time.perf_counter() - before_controller_read_t
         
         from_idx = 0
