@@ -1,6 +1,7 @@
 """
 Modified AudioGripperController that connects to the chatbot server to receive
 audio data and emotion information for controlling the gripper.
+Uses consistent audio processing for both live and fallback audio.
 """
 
 from lerobot.common.robot_devices.controllers.configs import AudioGripperControllerConfig
@@ -34,7 +35,10 @@ SAMPLING_RATE = 16000  # in Hz
 BLOCK_DURATION = 0.05  # in seconds (50 ms)
 THRESHOLD = 0.02       # Adjust this value based on your microphone sensitivity
 
-MAX_RMS = 0.4
+# Audio processing parameters
+FRAME_LENGTH = 2048    # Frame length for envelope extraction
+HOP_LENGTH = 512       # Hop length for envelope extraction
+SMOOTHING_WINDOW = 5   # Window size for temporal smoothing
 
 # Emotion to intensity mapping (for more expressive movements)
 EMOTION_INTENSITY = {
@@ -47,12 +51,43 @@ EMOTION_INTENSITY = {
     "surprised": 1.3,  # Very intense movements
 }
 
-def smooth_signal(y, cutoff=5.0):
-    """Apply low-pass filter to smooth audio envelope"""
-    nyquist = 0.5 * RATE
-    normal_cutoff = cutoff / nyquist
-    b, a = butter(4, normal_cutoff, btype='low', analog=False)
-    return filtfilt(b, a, np.abs(y))
+def extract_mouth_envelope(audio_data, sr=RATE):
+    """
+    Extract mouth opening envelope from audio data using the same
+    high-quality method used for the fallback audio.
+    
+    Args:
+        audio_data: numpy array of audio samples
+        sr: sample rate of the audio
+        
+    Returns:
+        normalized envelope values
+    """
+    # Check if we have enough data for processing
+    if len(audio_data) < FRAME_LENGTH:
+        # Pad with zeros if needed
+        audio_data = np.pad(audio_data, (0, FRAME_LENGTH - len(audio_data)), 'constant')
+    
+    # Extract RMS energy (same as in generate_mouth_values)
+    envelope = librosa.feature.rms(
+        y=audio_data, 
+        frame_length=FRAME_LENGTH, 
+        hop_length=HOP_LENGTH
+    )[0]
+    
+    # Apply temporal smoothing
+    if len(envelope) > 1:
+        smoothed = np.convolve(envelope, np.hanning(SMOOTHING_WINDOW), mode='same')
+    else:
+        smoothed = envelope
+    
+    # Normalize to 0-1 range
+    if np.max(smoothed) > np.min(smoothed):
+        normalized = (smoothed - np.min(smoothed)) / (np.max(smoothed) - np.min(smoothed))
+    else:
+        normalized = np.zeros_like(smoothed)
+    
+    return normalized
 
 class AudioGripperController:
     def __init__(
@@ -78,6 +113,10 @@ class AudioGripperController:
         self.current_audio = None
         self.current_emotion = "curious"  # Default emotion
         self.emotion_modifier = 1.0  # Default emotion intensity modifier
+        
+        # Buffer for recent audio (to have enough context for processing)
+        self.audio_buffer = np.array([], dtype=np.float32)
+        self.buffer_max_size = RATE * 1  # 1 second of audio at RATE
         
         # Socket connection to chatbot
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -148,6 +187,10 @@ class AudioGripperController:
                         self.current_emotion = emotion
                         self.emotion_modifier = EMOTION_INTENSITY.get(emotion, 1.0)
                         self.current_audio = audio_data
+                        
+                        # Add new audio to buffer
+                        self.update_audio_buffer(audio_data)
+                        
                         # Add timestamp for when audio was last updated
                         self.audio_timestamp = time.time()
                         
@@ -164,48 +207,47 @@ class AudioGripperController:
             self.connected_to_chatbot = False
             self.use_chatbot = False
 
+    def update_audio_buffer(self, new_audio):
+        """Update the audio buffer with new audio data."""
+        if len(new_audio) == 0:
+            return
+            
+        # Append new audio to buffer
+        self.audio_buffer = np.append(self.audio_buffer, new_audio)
+        
+        # Trim buffer if it's too long
+        if len(self.audio_buffer) > self.buffer_max_size:
+            self.audio_buffer = self.audio_buffer[-self.buffer_max_size:]
+
     def process_audio_chunk(self):
-        """Process current audio chunk to control gripper."""
+        """Process current audio buffer to control gripper using the same method as fallback audio."""
         try:
             with self.lock:
-                audio = self.current_audio
+                audio_buffer = self.audio_buffer.copy()
                 emotion_mod = self.emotion_modifier
                 
-            if audio is None or len(audio) == 0:
+            if len(audio_buffer) == 0:
                 return
                 
-            # Calculate RMS of the audio chunk
-            rms = np.sqrt(np.mean(np.square(audio)))
+            # Extract mouth envelope using the same method as the fallback audio
+            normalized_envelope = extract_mouth_envelope(audio_buffer)
             
-            # Apply a minimum threshold to avoid tiny movements
-            if rms < 0.01:
-                rms = 0
+            # Use the last value from the envelope as the current mouth position
+            if len(normalized_envelope) > 0:
+                mouth_position = normalized_envelope[-1]
                 
-            # Apply basic intensity modification
-            modified_rms = rms * emotion_mod
-            
-            # Amplify the signal (make movement more pronounced)
-            amplified_rms = modified_rms * 1.5
-            
-            # Normalize and clamp to 0-1 range
-            normalized_intensity = max(min(amplified_rms / MAX_RMS, 1.0), 0.0)
-            
-            # Map to gripper position with a minimum movement threshold
-            if normalized_intensity < 0.05:
-                # Below threshold, go to rest position
-                gripper_pos = self.min_angle
-            else:
-                # Above threshold, map to position range
-                # Use a non-linear mapping to make small sounds more visible
-                adjusted_intensity = normalized_intensity ** 0.7  # Power less than 1 amplifies small values
-                gripper_pos = adjusted_intensity * (self.max_angle - self.min_angle) + self.min_angle
-            
-            # Update gripper position
-            self.current_positions[self.config.motor_id] = gripper_pos
-            
-            # Debug logging
-            if logging.getLogger().level <= logging.DEBUG:
-                logging.debug(f"Audio RMS: {rms:.4f}, Position: {gripper_pos:.2f}")
+                # Apply emotion modifier
+                modified_position = mouth_position * emotion_mod
+                
+                # Map to gripper position
+                gripper_pos = modified_position * (self.max_angle - self.min_angle) + self.min_angle
+                
+                # Update gripper position
+                self.current_positions[self.config.motor_id] = gripper_pos
+                
+                # Debug logging
+                if logging.getLogger().level <= logging.DEBUG:
+                    logging.debug(f"Mouth position: {mouth_position:.4f}, Modified: {modified_position:.4f}, Gripper: {gripper_pos:.2f}")
             
         except Exception as e:
             logging.error(f"Error processing audio chunk: {e}")
@@ -216,8 +258,8 @@ class AudioGripperController:
         times = librosa.times_like(y, sr=sr)
         
         # Extract amplitude envelope with psychoacoustic weighting
-        envelope = librosa.feature.rms(y=y, frame_length=2048, hop_length=512)[0]
-        smoothed = np.convolve(envelope, np.hanning(5), mode='same')  # Temporal smoothing
+        envelope = librosa.feature.rms(y=y, frame_length=FRAME_LENGTH, hop_length=HOP_LENGTH)[0]
+        smoothed = np.convolve(envelope, np.hanning(SMOOTHING_WINDOW), mode='same')  # Temporal smoothing
         normalized = (smoothed - np.min(smoothed)) / (np.max(smoothed) - np.min(smoothed))
         
         return times, normalized
@@ -296,7 +338,7 @@ class AudioGripperController:
                 
                 # Check if we have fresh audio data to process
                 with self.lock:
-                    has_audio = self.current_audio is not None and len(self.current_audio) > 0
+                    has_audio = len(self.audio_buffer) > 0
                     # Get a timestamp for when audio was last updated
                     audio_timestamp = getattr(self, 'audio_timestamp', 0)
                 
