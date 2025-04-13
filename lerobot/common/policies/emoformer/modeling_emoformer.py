@@ -45,28 +45,6 @@ from sklearn.manifold import TSNE
 from sklearn.preprocessing import StandardScaler
 
 
-
-def extract_emotion(text):
-    text = text.lower()
-
-    if "sad" in text:
-        return "sad"
-    elif "surprised" in text:
-        return "surprised"
-    elif "happy" in text or "happiness" in text or "cheerful" in text:
-        return "happy"
-    elif "angry" in text or "anger" in text or "rage" in text:
-        return "angry"
-    elif "fear" in text or "terrified" in text or "terror" in text:
-        return "fearful"
-    elif "curious" in text or "curiosity" in text:
-        return "curious"
-    elif "playful" in text or "playfulness" in text:
-        return "playful"
-    else:
-        return "unknown"
-
-
 class EmoFormerPolicy(PreTrainedPolicy):
     """
     Action Chunking Transformer Policy as per Learning Fine-Grained Bimanual Manipulation with Low-Cost
@@ -155,10 +133,10 @@ class EmoFormerPolicy(PreTrainedPolicy):
 
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict]:
         """Run the batch through the model and compute the loss for training or validation."""
+        targets = batch["targets"]
         batch = self.normalize_inputs(batch)
         batch = self.normalize_targets(batch)
         actions_hat = self.model(batch)
-
         l1_loss = (
             F.l1_loss(batch["action"], actions_hat, reduction="none") * ~batch["action_is_pad"].unsqueeze(-1)
         ).mean()
@@ -183,50 +161,167 @@ class PositionalEncoding(nn.Module):
         x = x + self.pe[:, :x.size(1)]
         return x
 
-class Emoformer(nn.Module):
-    #Emotions Transformer: The underlying neural network for EmoFormerPolicy.
-    def __init__(self, config: EmoFormerConfig, num_joints=12, emotion_vocab_size=7, d_model=64, nhead=4, num_layers=3, ff_dim=128, max_len=100):
+class EmoFormer(nn.Module):
+    """Emotions Transformer: The underlying neural network for EmoFormerPolicy."""
+    def __init__(self, config: EmoFormerConfig = None, 
+                num_joints=6, 
+                emotion_vocab_size=7, 
+                d_model=64, 
+                nhead=4, 
+                num_layers=3, 
+                ff_dim=128, 
+                max_len=100,
+                fft_feature_dim=None):
         super().__init__()
 
         self.config = config
-
+        
+        # Input projection for joint state
         self.joint_proj = nn.Linear(num_joints, d_model // 2)
+        
+        # Emotion embedding
         self.emotion_embedding = nn.Embedding(emotion_vocab_size, d_model // 2)
         
+        # Positional encoding
         self.pos_encoder = PositionalEncoding(d_model, max_len)
         
+        # Transformer encoder
         encoder_layer = nn.TransformerEncoderLayer(d_model, nhead, ff_dim, batch_first=True)
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers)
-
-        self.action_head = nn.Linear(config.dim_model, self.config.action_feature.shape[0])
-
-    def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, tuple[Tensor, Tensor] | tuple[None, None]]:
-        """
-        joint_states: (batch_size, seq_len, num_joints)
-        emotion_ids:  (batch_size, seq_len) or (batch_size,) if emotion is constant
-        """
-        emotion_id = batch["observation.emotion_ids"]
-        batch_size = batch["observation.state"].shape[0]
-        joint_state = batch["observation.state"]
-
-        joint_emb = self.joint_proj(joint_state)  # (B, S, d_model//2)
         
-        if emotion_ids.ndim == 2:
-            emo_emb = self.emotion_embedding(emotion_id)  # (B, S, d_model//2)
+        # FFT prediction head
+        # If fft_feature_dim is not provided, we'll assume a default size
+        if fft_feature_dim is None:
+            # Default FFT output shape based on max_freq=5.0, fps=30, window_sec=1.5
+            # Assuming around 8 frequency bins after filtering (this would need adjustment based on actual output)
+            self.fft_feature_dim = num_joints * 8
         else:
-            emo_emb = self.emotion_embedding(emotion_ids).unsqueeze(1)  # (B, 1, d_model//2)
-            emo_emb = emo_emb.expand(-1, joint_states.size(1), -1)  # (B, S, d_model//2)
+            self.fft_feature_dim = fft_feature_dim
+            
+        self.action_head = nn.Linear(d_model, self.fft_feature_dim)
 
-        x = torch.cat([joint_emb, emo_emb], dim=-1)  # (B, S, d_model)
+    def forward(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
+        """
+        Forward pass through the EmoFormer model.
+        
+        Args:
+            batch: Dictionary containing:
+                - inputs: (batch_size, num_joints) - Current joint state
+                - emotion_idx: (batch_size,) - Emotion indices
+                
+        Returns:
+            fft_features: (batch_size, num_joints, num_freq_bins) - Predicted FFT features
+        """
+        # Get inputs from batch
+        joint_state = batch["inputs"]  # (batch_size, num_joints)
+        emotion_idx = batch["emotion_idx"]  # (batch_size,)
+        
+        batch_size = joint_state.shape[0]
+        
+        # Project joint state to embedding space
+        joint_emb = self.joint_proj(joint_state)  # (batch_size, d_model//2)
+        
+        # Get emotion embeddings
+        emo_emb = self.emotion_embedding(emotion_idx)  # (batch_size, d_model//2)
+        
+        # Concatenate joint and emotion embeddings
+        x = torch.cat([joint_emb, emo_emb], dim=-1)  # (batch_size, d_model)
+        
+        # Add sequence dimension for transformer (batch_size, 1, d_model)
+        x = x.unsqueeze(1)
+        
+        # Add positional encoding
         x = self.pos_encoder(x)
-        x = self.encoder(x)  # (B, S, d_model)
+        
+        # Pass through transformer encoder
+        x = self.encoder(x)  # (batch_size, 1, d_model)
+        
+        # Extract features from sequence
+        x = x.squeeze(1)  # (batch_size, d_model)
+        
+        # Project to FFT feature space
+        fft_features = self.action_head(x)  # (batch_size, fft_feature_dim)
+        
+        # Reshape to match the expected output format [batch_size, num_joints, num_freq_bins]
+        num_joints = batch["inputs"].shape[1]
+        num_freq_bins = self.fft_feature_dim // num_joints
+        
+        fft_features = fft_features.reshape(batch_size, num_joints, num_freq_bins)
+        
+        return fft_features
 
-        actions = self.action_head(decoder_out)
-
-        return actions
-
-
-if __name__ == "__main__":
-    data = load_robot_data(base_dir="/home/rgarciap/Data2/lerobot_emotions")
+def create_emoformer_model(dataset):
+    """Create an EmoFormer model based on the dataset dimensions."""
+    # Get dataset dimensions
+    num_joints = dataset.get_input_dim()
+    output_shape = dataset.get_output_shape()  # [num_joints, num_freq_bins]
+    num_emotions = len(dataset.emotions)
     
-    print(data)
+    # Calculate FFT feature dimension
+    fft_feature_dim = output_shape[0] * output_shape[1]  # num_joints * num_freq_bins
+    
+    # Create model
+    model = EmoFormer(
+        num_joints=num_joints,
+        emotion_vocab_size=num_emotions,
+        d_model=64,  # Can be adjusted
+        nhead=4,     # Can be adjusted
+        num_layers=3,  # Can be adjusted
+        ff_dim=128,    # Can be adjusted
+        fft_feature_dim=fft_feature_dim
+    )
+    
+    return model
+
+# Example usage:
+if __name__ == "__main__":
+    from lerobot.common.datasets.trajectory_fft_dataset import TrajectoryFFTLabelDataset
+
+    # Example: create synthetic data for testing
+    num_episodes = 100
+    timesteps_per_episode = 600  # 500-800 samples per trajectory
+    num_joints = 6  # 6-DOF
+    
+    # Create random trajectories
+    np.random.seed(42)
+    trajectories = []
+    task_descriptions = []
+    
+    for i in range(num_episodes):
+        # Create sinusoidal trajectories with different frequencies for each joint
+        t = np.linspace(0, 20, timesteps_per_episode)
+        traj = np.zeros((timesteps_per_episode, num_joints))
+        
+        for j in range(num_joints):
+            freq = 0.5 + j * 0.2  # Different frequency for each joint
+            traj[:, j] = np.sin(2 * np.pi * freq * t) + 0.1 * np.random.randn(len(t))
+        
+        trajectories.append(traj)
+        
+        # Assign random emotions
+        emotions = ['happy', 'angry', 'sad', 'surprised', 'fearful', 'curious', 'playful']
+        emotion = np.random.choice(emotions)
+        task_descriptions.append(f"Move with {emotion} emotion")
+    
+    # Create dataset
+    dataset = TrajectoryFFTLabelDataset(
+        trajectories=trajectories,
+        task_descriptions=task_descriptions,
+        fps=30, 
+        window_sec=1.5,
+        overlap=0.5,
+        max_freq=5.0
+    )
+    
+    
+    # Create model
+    model = create_emoformer_model(dataset)
+    
+    # Create DataLoader
+    dataloader = DataLoader(dataset, batch_size=32, shuffle=True)
+    
+    # Example forward pass
+    for batch in dataloader:
+        outputs = model(batch)
+        print(f"Model output shape: {outputs.shape}")
+        break

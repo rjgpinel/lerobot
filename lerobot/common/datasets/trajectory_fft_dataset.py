@@ -273,7 +273,7 @@ class TrajectoryFFTLabelDataset(Dataset):
 # Example usage
 if __name__ == "__main__":
     # Example: create synthetic data for testing
-    num_episodes = 5
+    num_episodes = 100
     timesteps_per_episode = 600  # 500-800 samples per trajectory
     num_joints = 6  # 6-DOF
     
@@ -323,7 +323,7 @@ if __name__ == "__main__":
         targets = batch["targets"]
         emotion_idx = batch["emotion_idx"]
         metadata = batch["metadata"]
-        
+
         print(f"Batch inputs shape: {inputs.shape}")
         print(f"Batch targets shape: {targets.shape}")
         print(f"Batch emotion indices: {emotion_idx[:5]}")
