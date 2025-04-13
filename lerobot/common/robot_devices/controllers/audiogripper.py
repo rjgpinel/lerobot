@@ -187,6 +187,8 @@ class AudioGripperController:
             # Map to gripper position
             gripper_pos = normalized_intensity * (self.max_angle - self.min_angle) + self.min_angle
             
+            print(f"Gripper position: {gripper_pos} | Emotion: {self.current_emotion} | Intensity: {normalized_intensity}")
+
             # Update gripper position
             self.current_positions[self.config.motor_id] = gripper_pos
             
