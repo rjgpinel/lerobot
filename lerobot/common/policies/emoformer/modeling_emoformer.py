@@ -31,7 +31,6 @@ import torch
 import torch.nn.functional as F  # noqa: N812
 import torchvision
 from torch import Tensor, nn
-from torch.utils.data import DataLoader
 from torchvision.models._utils import IntermediateLayerGetter
 from torchvision.ops.misc import FrozenBatchNorm2d
 
@@ -41,15 +40,12 @@ from lerobot.common.policies.pretrained import PreTrainedPolicy
 import os
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
 from sklearn.manifold import TSNE
 from sklearn.preprocessing import StandardScaler
 
-
 class EmoFormerPolicy(PreTrainedPolicy):
     """
-    Action Chunking Transformer Policy as per Learning Fine-Grained Bimanual Manipulation with Low-Cost
-    Hardware (paper: https://arxiv.org/abs/2304.13705, code: https://github.com/tonyzhaozh/act)
+    Action Chunking Transformer Policy adapted for FFT-based emotion trajectory prediction
     """
 
     config_class = EmoFormerConfig
@@ -71,82 +67,214 @@ class EmoFormerPolicy(PreTrainedPolicy):
         config.validate_features()
         self.config = config
 
-        self.normalize_inputs = Normalize(config.input_features, config.normalization_mapping, dataset_stats)
-        self.normalize_targets = Normalize(
-            config.output_features, config.normalization_mapping, dataset_stats
+        # Adapt normalization to the new data format
+        # For FFT dataset, we need to normalize:
+        # - inputs: joint states (num_joints)
+        # - targets: FFT features (num_joints, num_freq_bins)
+        
+        self.normalize_inputs = FFTNormalize("inputs", dataset_stats)
+        self.normalize_targets = FFTNormalize("targets", dataset_stats)
+        self.unnormalize_outputs = FFTUnnormalize("targets", dataset_stats)
+
+        # Initialize the model with proper dimensions from config
+        self.model = EmoFormer(
+            config=config,
+            num_joints=config.input_dim,
+            emotion_vocab_size=config.emotion_vocab_size,
+            d_model=config.dim_model,
+            nhead=config.num_attention_heads,
+            num_layers=config.num_hidden_layers,
+            ff_dim=config.intermediate_size,
+            fft_feature_dim=config.output_dim
         )
-        self.unnormalize_outputs = Unnormalize(
-            config.output_features, config.normalization_mapping, dataset_stats
-        )
 
-        self.model = EmoFormer(config)
+    def get_optim_params(self) -> list[dict]:
+        """Return parameters for optimization."""
+        return [{"params": [p for p in self.parameters() if p.requires_grad]}]
 
-        self.reset()
-
-    def get_optim_params(self) -> dict:
-        # TODO(aliberts, rcadene): As of now, lr_backbone == lr
-        # Should we remove this and just `return self.parameters()`?
-        return [
-            {
-                "params": [
-                    p
-                    for n, p in self.named_parameters()
-                    if not n.startswith("model.backbone") and p.requires_grad
-                ]
-            },
-            {
-                "params": [
-                    p
-                    for n, p in self.named_parameters()
-                    if n.startswith("model.backbone") and p.requires_grad
-                ],
-                "lr": self.config.optimizer_lr_backbone,
-            },
-        ]
-
-    def reset(self):
-        """This should be called whenever the environment is reset."""
-        self._action_queue = deque([], maxlen=self.config.n_action_steps)
-
-    @torch.no_grad
+    @torch.no_grad()
     def select_action(self, batch: dict[str, Tensor]) -> Tensor:
-        """Select a single action given environment observations.
-
-        This method wraps `select_actions` in order to return one action at a time for execution in the
-        environment. It works by managing the actions in a queue and only calling `select_actions` when the
-        queue is empty.
-        """
+        """Predict FFT features given joint state and emotion."""
         self.eval()
-
+        
+        # Normalize inputs
         batch = self.normalize_inputs(batch)
-        # Action queue logic for n_action_steps > 1. When the action_queue is depleted, populate it by
-        # querying the policy.
-        if len(self._action_queue) == 0:
-            actions = self.model(batch)[0][:, : self.config.n_action_steps]
-
-            # TODO(rcadene): make _forward return output dictionary?
-            actions = self.unnormalize_outputs({"action": actions})["action"]
-
-            # `self.model.forward` returns a (batch_size, n_action_steps, action_dim) tensor, but the queue
-            # effectively has shape (n_action_steps, batch_size, *), hence the transpose.
-            self._action_queue.extend(actions.transpose(0, 1))
-        return self._action_queue.popleft()
+        
+        # Forward pass
+        fft_features = self.model(batch)
+        
+        # Unnormalize outputs
+        outputs = {"targets": fft_features}
+        outputs = self.unnormalize_outputs(outputs)
+        
+        return outputs["targets"]
 
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict]:
         """Run the batch through the model and compute the loss for training or validation."""
+        # Store original targets for loss computation
         targets = batch["targets"]
+        
+        # Normalize inputs and targets
         batch = self.normalize_inputs(batch)
         batch = self.normalize_targets(batch)
-        actions_hat = self.model(batch)
-        l1_loss = (
-            F.l1_loss(batch["action"], actions_hat, reduction="none") * ~batch["action_is_pad"].unsqueeze(-1)
-        ).mean()
-
-        loss_dict = {"l1_loss": l1_loss.item()}
-        loss = l1_loss
+        
+        # Forward pass through model
+        fft_features_pred = self.model(batch)
+        
+        # Compute loss (MSE loss for FFT features)
+        mse_loss = F.mse_loss(batch["targets"], fft_features_pred)
+        
+        loss_dict = {"mse_loss": mse_loss.item()}
+        loss = mse_loss
 
         return loss, loss_dict
 
+
+class FFTNormalize:
+    """Normalization class for FFT dataset features."""
+    
+    def __init__(self, key, dataset_stats=None):
+        """
+        Initialize the normalization class.
+        
+        Args:
+            key: The key to normalize ("inputs" or "targets")
+            dataset_stats: Dictionary with statistics for normalization
+        """
+        self.key = key
+        self.dataset_stats = dataset_stats
+        
+    def __call__(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
+        """
+        Normalize the specified key in the batch.
+        
+        Args:
+            batch: Dictionary with tensors
+            
+        Returns:
+            Updated batch with normalized values
+        """
+        if self.dataset_stats is None:
+            # Return batch unchanged if no stats available
+            return batch
+            
+        if self.key not in batch:
+            return batch
+            
+        # Get normalization stats
+        stats = self.dataset_stats[self.key]
+        mean = stats["mean"]
+        std = stats["std"]
+        
+        # Normalize (assumes mean and std have proper broadcasting dimensions)
+        batch[self.key] = (batch[self.key] - mean) / (std + 1e-8)
+        
+        return batch
+
+
+class FFTUnnormalize:
+    """Unnormalization class for FFT dataset features."""
+    
+    def __init__(self, key, dataset_stats=None):
+        """
+        Initialize the unnormalization class.
+        
+        Args:
+            key: The key to unnormalize ("inputs" or "targets")
+            dataset_stats: Dictionary with statistics for normalization
+        """
+        self.key = key
+        self.dataset_stats = dataset_stats
+        
+    def __call__(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
+        """
+        Unnormalize the specified key in the batch.
+        
+        Args:
+            batch: Dictionary with tensors
+            
+        Returns:
+            Updated batch with unnormalized values
+        """
+        if self.dataset_stats is None:
+            # Return batch unchanged if no stats available
+            return batch
+            
+        if self.key not in batch:
+            return batch
+            
+        # Get normalization stats
+        stats = self.dataset_stats[self.key]
+        mean = stats["mean"]
+        std = stats["std"]
+        
+        # Unnormalize
+        batch[self.key] = batch[self.key] * (std + 1e-8) + mean
+        
+        return batch
+
+
+# Function to compute dataset statistics for normalization
+def compute_dataset_stats(dataloader):
+    """
+    Compute mean and std for dataset normalization.
+    
+    Args:
+        dataloader: DataLoader object
+        
+    Returns:
+        Dictionary with statistics for inputs and targets
+    """
+    # Initialize accumulators
+    input_sum = 0
+    input_squared_sum = 0
+    target_sum = 0
+    target_squared_sum = 0
+    count = 0
+    
+    # First pass: compute sums for mean calculation
+    for batch in dataloader:
+        inputs = batch["inputs"]
+        targets = batch["targets"]
+        
+        batch_size = inputs.shape[0]
+        count += batch_size
+        
+        input_sum += inputs.sum(dim=0)
+        input_squared_sum += (inputs ** 2).sum(dim=0)
+        
+        # For targets, we need to reshape to handle the 3D tensor
+        targets_flat = targets.view(batch_size, -1)
+        target_sum += targets_flat.sum(dim=0)
+        target_squared_sum += (targets_flat ** 2).sum(dim=0)
+    
+    # Compute mean
+    input_mean = input_sum / count
+    target_mean = target_sum / count
+    
+    # Reshape target mean to match original dimensions
+    # Assuming all target tensors have the same shape
+    target_shape = dataloader.dataset[0]["targets"].shape
+    target_mean = target_mean.view(target_shape)
+    
+    # Compute std
+    input_std = torch.sqrt(input_squared_sum / count - input_mean ** 2)
+    target_std = torch.sqrt(target_squared_sum / count - (target_sum / count) ** 2)
+    target_std = target_std.view(target_shape)
+    
+    # Create stats dictionary
+    stats = {
+        "inputs": {
+            "mean": input_mean,
+            "std": input_std
+        },
+        "targets": {
+            "mean": target_mean,
+            "std": target_std
+        }
+    }
+    
+    return stats
 
 class PositionalEncoding(nn.Module):
     def __init__(self, d_model, max_len=100):
@@ -274,10 +402,64 @@ def create_emoformer_model(dataset):
     
     return model
 
-# Example usage:
-if __name__ == "__main__":
-    from lerobot.common.datasets.trajectory_fft_dataset import TrajectoryFFTLabelDataset
+# # Example usage:
+# if __name__ == "__main__":
+#     from lerobot.common.datasets.trajectory_fft_dataset import TrajectoryFFTLabelDataset
 
+#     # Example: create synthetic data for testing
+#     num_episodes = 100
+#     timesteps_per_episode = 600  # 500-800 samples per trajectory
+#     num_joints = 6  # 6-DOF
+    
+#     # Create random trajectories
+#     np.random.seed(42)
+#     trajectories = []
+#     task_descriptions = []
+    
+#     for i in range(num_episodes):
+#         # Create sinusoidal trajectories with different frequencies for each joint
+#         t = np.linspace(0, 20, timesteps_per_episode)
+#         traj = np.zeros((timesteps_per_episode, num_joints))
+        
+#         for j in range(num_joints):
+#             freq = 0.5 + j * 0.2  # Different frequency for each joint
+#             traj[:, j] = np.sin(2 * np.pi * freq * t) + 0.1 * np.random.randn(len(t))
+        
+#         trajectories.append(traj)
+        
+#         # Assign random emotions
+#         emotions = ['happy', 'angry', 'sad', 'surprised', 'fearful', 'curious', 'playful']
+#         emotion = np.random.choice(emotions)
+#         task_descriptions.append(f"Move with {emotion} emotion")
+    
+#     # Create dataset
+#     dataset = TrajectoryFFTLabelDataset(
+#         trajectories=trajectories,
+#         task_descriptions=task_descriptions,
+#         fps=30, 
+#         window_sec=1.5,
+#         overlap=0.5,
+#         max_freq=5.0
+#     )
+    
+    
+#     # Create model
+#     model = create_emoformer_model(dataset)
+    
+#     # Create DataLoader
+#     dataloader = DataLoader(dataset, batch_size=32, shuffle=True)
+    
+#     # Example forward pass
+#     for batch in dataloader:
+#         outputs = model(batch)
+#         print(f"Model output shape: {outputs.shape}")
+#         break
+
+if __name__ == "__main__":
+    # Add missing imports
+    import torch
+    from torch.utils.data import DataLoader
+    from lerobot.common.datasets.trajectory_fft_dataset import TrajectoryFFTLabelDataset
     # Example: create synthetic data for testing
     num_episodes = 100
     timesteps_per_episode = 600  # 500-800 samples per trajectory
@@ -314,9 +496,15 @@ if __name__ == "__main__":
         max_freq=5.0
     )
     
+    # Print dataset statistics
+    print(f"Dataset size: {len(dataset)}")
+    print(f"Emotion distribution: {dataset.get_emotion_distribution()}")
+    print(f"Input dimension: {dataset.get_input_dim()}")
+    print(f"Output shape: {dataset.get_output_shape()}")
     
     # Create model
     model = create_emoformer_model(dataset)
+    print(f"Model created with {sum(p.numel() for p in model.parameters())} parameters")
     
     # Create DataLoader
     dataloader = DataLoader(dataset, batch_size=32, shuffle=True)
@@ -324,5 +512,20 @@ if __name__ == "__main__":
     # Example forward pass
     for batch in dataloader:
         outputs = model(batch)
+        print(f"Input shape: {batch['inputs'].shape}")
+        print(f"Emotion indices: {batch['emotion_idx'][:5]}")
         print(f"Model output shape: {outputs.shape}")
+        print(f"Target shape: {batch['targets'].shape}")
+        
+        # Compare output and target shapes
+        if outputs.shape == batch['targets'].shape:
+            print("Output shape matches target shape ✓")
+        else:
+            print(f"Shape mismatch! Output: {outputs.shape}, Target: {batch['targets'].shape}")
+        
+        # Calculate sample loss
+        mse_loss = F.mse_loss(outputs, batch['targets']).item()
+        print(f"Sample MSE loss: {mse_loss:.4f}")
         break
+    
+    print("EmoFormer test completed successfully!")
