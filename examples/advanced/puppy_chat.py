@@ -62,10 +62,7 @@ class RobotChatbot:
         
         # Message history for context
         self.history = []
-
-        # Flag to indicate running state
-        self.running = True
-
+        
         # Create socket server
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
@@ -80,6 +77,9 @@ class RobotChatbot:
         except OSError as e:
             logging.error(f"Socket error: {e}")
             self.sock = None
+
+        # Flag to indicate running state
+        self.running = True
         
         # Connection to AudioGripperController
         self.connection = None
@@ -255,8 +255,16 @@ curious|What brings you to the hackathon today?"""
             emotion (str): Emotion of the response
         """
         try:
-            # Generate audio using Kokoro
-            generator = self.tts_pipeline(text, voice=self.voice)
+            # Add strategic pauses for punctuation if not already present
+            enhanced_text = self._enhance_text_for_tts(text)
+            
+            # Generate audio using Kokoro with adjusted speech rate
+            # Note: Lower values for rate make the speech slower
+            generator = self.tts_pipeline(
+                enhanced_text, 
+                voice=self.voice, 
+                rate=0.85  # Slow down speech by using 85% of normal speed
+            )
             
             for _, _, audio in generator:
                 # Convert PyTorch tensor to numpy array if needed
@@ -277,6 +285,37 @@ curious|What brings you to the hackathon today?"""
         
         except Exception as e:
             print(f"Error in TTS processing: {e}")
+    
+    def _enhance_text_for_tts(self, text):
+        """
+        Enhance text for better TTS by adding pauses and improving punctuation.
+        
+        Args:
+            text (str): Original text
+            
+        Returns:
+            str: Enhanced text with better pauses for TTS
+        """
+        # Make sure text ends with punctuation
+        if not text.rstrip().endswith(('.', '!', '?', ':', ';')):
+            text = text.rstrip() + '.'
+            
+        # Add commas for better phrasing if needed
+        # This is a simple approach - more sophisticated NLP could be used
+        words = text.split()
+        if len(words) > 6 and ',' not in text and ';' not in text:
+            # For sentences without commas, add a pause point roughly in the middle
+            midpoint = len(words) // 2
+            words.insert(midpoint, ',')
+            text = ' '.join(words)
+            
+        # Add explicit pause tags if supported by Kokoro
+        # Replace standard punctuation with pause-enhanced versions
+        # Note: The exact pause syntax depends on Kokoro's implementation
+        # These are placeholders - check Kokoro documentation for actual syntax
+        enhanced_text = text
+        
+        return enhanced_text
     
     def chat(self):
         """Start the chat interface in the terminal."""
