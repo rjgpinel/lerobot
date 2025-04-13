@@ -11,6 +11,7 @@ import numpy as np
 import torch
 from colorama import Fore, Style, init
 
+
 class PuppyChatbot:
     def __init__(self, api_key, lip_sync_callback, voice="af_heart", lang_code="a"):
         """
@@ -52,7 +53,36 @@ class PuppyChatbot:
         self.lip_sync_thread = threading.Thread(target=self._lip_sync_worker)
         self.lip_sync_thread.daemon = True
         self.lip_sync_thread.start()
+
+    def _change_mood(self, user_input):
+        """
+        Change the mood of the chatbot.
         
+        Args:
+            user_input (str): User command to change mood
+            
+        Returns:
+            bool: True if mood was changed, False otherwise
+        """
+        # Check if this is a mood change command
+        if not user_input.startswith("/mood "):
+            return False
+            
+        # Extract the requested mood
+        requested_mood = user_input[6:].strip().lower()
+        
+        # Check if it's a valid mood
+        if requested_mood in self.available_moods:
+            old_mood = self.mood
+            self.mood = requested_mood
+            print(f"{Fore.CYAN}🐶 Mood changed from {old_mood} to {self.mood}{Style.RESET_ALL}")
+            return True
+        else:
+            # List available moods
+            moods_list = ", ".join(self.available_moods)
+            print(f"{Fore.YELLOW}Available moods: {moods_list}{Style.RESET_ALL}")
+            return True  # Still handled the command, even if mood didn't change
+
     def _lip_sync_worker(self):
         """Worker thread that calls the lip sync callback every 1ms with new audio data."""
         while self.running:
@@ -63,36 +93,7 @@ class PuppyChatbot:
                 self.lip_sync_callback(audio_chunk)
             # Sleep for 1ms
             time.sleep(0.001)
-
-    def _change_mood(self, user_input):
-            """
-            Change the mood of the chatbot.
-            
-            Args:
-                user_input (str): User command to change mood
-                
-            Returns:
-                bool: True if mood was changed, False otherwise
-            """
-            # Check if this is a mood change command
-            if not user_input.startswith("/mood "):
-                return False
-                
-            # Extract the requested mood
-            requested_mood = user_input[6:].strip().lower()
-            
-            # Check if it's a valid mood
-            if requested_mood in self.available_moods:
-                old_mood = self.mood
-                self.mood = requested_mood
-                print(f"{Fore.CYAN}🐶 Mood changed from {old_mood} to {self.mood}{Style.RESET_ALL}")
-                return True
-            else:
-                # List available moods
-                moods_list = ", ".join(self.available_moods)
-                print(f"{Fore.YELLOW}Available moods: {moods_list}{Style.RESET_ALL}")
-                return True  # Still handled the command, even if mood didn't change
-
+    
     def _call_mistral_api(self, user_message):
         """
         Call the Mistral API with the user message and conversation history.
@@ -145,7 +146,7 @@ Example: curious|What brings you to the hackathon today?"""
         ] + self.history
         
         data = {
-            "model": "mistral-medium",  # You can change this to other available models
+            "model": "mistral-small",  # Using a more capable model
             "messages": messages
         }
         
@@ -161,10 +162,13 @@ Example: curious|What brings you to the hackathon today?"""
                 parts = full_message.split("|", 1)
                 emotion = parts[0].strip().lower()
                 
-                # Ensure valid emotion (use the current mood as fallback)
+                # Ensure valid emotion
                 valid_emotions = self.available_moods
                 if emotion not in valid_emotions:
                     emotion = self.mood  # Default to current mood if parsing fails
+                else:
+                    # Update the chatbot's current mood to match the response emotion
+                    self.mood = emotion
                 
                 # Get the response content
                 if len(parts) > 1:
