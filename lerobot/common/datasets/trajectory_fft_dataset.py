@@ -1,7 +1,8 @@
 import os
 import numpy as np
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import DataLoader
+from lerobot.data import LeRobotDataset
 
 def extract_emotion(text):
     """Extract emotion from text description."""
@@ -24,35 +25,52 @@ def extract_emotion(text):
     else:
         return "unknown"
 
-class TrajectoryFFTLabelDataset(Dataset):
+class TrajectoryFFTLabelDataset(LeRobotDataset):
     """Dataset for trajectory FFT features with emotion labels for LeRobot."""
     
     def __init__(self, 
-                 trajectories=None, 
-                 task_descriptions=None,
-                 episode_ids=None,
-                 data_path=None,
+                 repo_id,
+                 root=None,
+                 episodes=None,
+                 delta_timestamps=None,
+                 image_transforms=None,
+                 revision=None,
+                 video_backend=None,
                  fps=30, 
                  window_sec=1.5, 
                  overlap=0.5,
-                 max_freq=5.0):
+                 max_freq=5.0,
+                 **kwargs):
         """
         Initialize the dataset.
         
         Args:
-            trajectories: List of trajectory arrays with shape [num_timesteps, num_joints] 
-                         or a single array with shape [num_episodes, num_timesteps, num_joints]
-            task_descriptions: List of task descriptions for emotion extraction
-            episode_ids: List of episode IDs (optional)
-            data_path: Path to data directory if trajectories not provided directly
+            repo_id: Repository ID for LeRobot dataset
+            root: Root directory for LeRobot dataset
+            episodes: Episodes to include in LeRobot dataset
+            delta_timestamps: Delta timestamps for LeRobot dataset
+            image_transforms: Image transforms for LeRobot dataset
+            revision: Revision for LeRobot dataset
+            video_backend: Video backend for LeRobot dataset
             fps: Frames per second of the trajectory data
             window_sec: Window size in seconds for FFT computation
             overlap: Overlap between consecutive windows (0.0-1.0)
             max_freq: Maximum frequency to keep in FFT features (Hz)
+            **kwargs: Additional arguments passed to LeRobotDataset
         """
-        super().__init__()
+        # Initialize the parent LeRobotDataset with required parameters
+        super().__init__(
+            repo_id=repo_id,
+            root=root,
+            episodes=episodes,
+            delta_timestamps=delta_timestamps,
+            image_transforms=image_transforms,
+            revision=revision,
+            video_backend=video_backend,
+            **kwargs
+        )
         
-        # Set parameters
+        # Set FFT parameters
         self.fps = fps
         self.window_size = int(fps * window_sec)
         self.step_size = int(self.window_size * (1 - overlap))
@@ -61,84 +79,29 @@ class TrajectoryFFTLabelDataset(Dataset):
         # Define emotion categories
         self.emotions = ['sad', 'surprised', 'happy', 'angry', 'fearful', 'curious', 'playful']
         
-        # Load data if not provided
-        if trajectories is None:
-            if data_path is None:
-                raise ValueError("Either trajectories or data_path must be provided")
-            trajectories, task_descriptions, episode_ids = self._load_data(data_path)
-        
-        # Process data
+        # Initialize samples list - will be populated when data is accessed
         self.samples = []
-        self._process_trajectories(trajectories, task_descriptions, episode_ids)
+        self.processed = False
         
-    def _load_data(self, data_path):
+    def _process_data(self):
         """
-        Load trajectory data from files.
-        Can be customized based on your specific file format.
-        
-        Returns:
-            trajectories: List of trajectory arrays
-            task_descriptions: List of task descriptions
-            episode_ids: List of episode IDs
+        Process LeRobot data to extract trajectories and prepare FFT samples.
+        This method is called lazily when data is first accessed.
         """
-        # This is a placeholder - implement based on your file format
-        # Example implementation for numpy files:
-        episode_files = sorted([f for f in os.listdir(data_path) if f.endswith('.npy')])
-        meta_file = os.path.join(data_path, 'metadata.npy')
-        
-        trajectories = []
-        task_descriptions = []
-        episode_ids = []
-        
-        # Load metadata if exists
-        if os.path.exists(meta_file):
-            metadata = np.load(meta_file, allow_pickle=True).item()
-            task_descriptions = metadata.get('tasks', [])
-            episode_ids = metadata.get('episode_ids', [])
-        
-        # Load trajectories
-        for i, file in enumerate(episode_files):
-            traj = np.load(os.path.join(data_path, file))
-            trajectories.append(traj)
+        if self.processed:
+            return
             
-            # If metadata doesn't contain enough entries, create placeholders
-            if i >= len(task_descriptions):
-                task_descriptions.append(f"Unknown task {i}")
-            if i >= len(episode_ids):
-                episode_ids.append(i)
+        # Get episodes from the parent dataset
+        episodes = super().episodes
         
-        return trajectories, task_descriptions, episode_ids
-        
-    def _process_trajectories(self, trajectories, task_descriptions, episode_ids=None):
-        """
-        Process trajectories and prepare samples.
-        
-        Args:
-            trajectories: List of trajectory arrays with shape [num_timesteps, num_joints]
-                          or a single array with shape [num_episodes, num_timesteps, num_joints]
-            task_descriptions: List of task descriptions for emotion extraction
-            episode_ids: List of episode IDs (optional)
-        """
-        # Handle different input formats
-        if isinstance(trajectories, np.ndarray) and trajectories.ndim == 3:
-            # Single array with shape [num_episodes, num_timesteps, num_joints]
-            traj_list = [trajectories[i] for i in range(trajectories.shape[0])]
-        else:
-            # List of arrays with shape [num_timesteps, num_joints]
-            traj_list = trajectories
-            
-        # Create default episode IDs if not provided
-        if episode_ids is None:
-            episode_ids = list(range(len(traj_list)))
-            
-        # Process each trajectory
-        for i, trajectory in enumerate(traj_list):
-            if i >= len(task_descriptions):
-                # Skip if no task description available
-                continue
+        for episode_idx, episode in enumerate(episodes):
+            # Extract task description
+            task_desc = episode.get('task', '')
+            if isinstance(task_desc, list) and len(task_desc) > 0:
+                task_desc = task_desc[0]
                 
             # Extract emotion from task description
-            emotion_str = extract_emotion(task_descriptions[i])
+            emotion_str = extract_emotion(task_desc)
             
             # Skip unknown emotions
             if emotion_str not in self.emotions:
@@ -147,24 +110,22 @@ class TrajectoryFFTLabelDataset(Dataset):
             # Get emotion index
             emotion_idx = self.emotions.index(emotion_str)
             
-            # Get episode ID
-            episode_id = episode_ids[i] if i < len(episode_ids) else i
+            # Extract trajectory from episode
+            trajectory = self._extract_trajectory_from_episode(episode)
             
-            # Ensure trajectory is numpy array
-            traj_array = np.asarray(trajectory)
-            
-            # Get number of joints
-            num_joints = traj_array.shape[1] if traj_array.ndim > 1 else 1
-            
+            # Skip if not enough data points
+            if len(trajectory) < self.window_size:
+                continue
+                
             # Create windows with specified overlap
-            n_samples = len(traj_array)
+            n_samples = len(trajectory)
             
             for start in range(0, n_samples - self.window_size + 1, self.step_size):
                 end = start + self.window_size
-                window = traj_array[start:end]
+                window = trajectory[start:end]
                 
                 # Get current joint state (input)
-                state = traj_array[start].astype(np.float32)
+                state = trajectory[start].astype(np.float32)
                 
                 # Compute FFT features for the window (output)
                 fft_features = self._compute_fft(window)
@@ -175,8 +136,42 @@ class TrajectoryFFTLabelDataset(Dataset):
                     "emotion_idx": emotion_idx,
                     "state": state,
                     "fft_features": fft_features,
-                    "episode_id": episode_id
+                    "episode_idx": episode_idx
                 })
+                
+        self.processed = True
+        
+    def _extract_trajectory_from_episode(self, episode):
+        """
+        Extract joint trajectory from an episode.
+        Override this method based on your specific episode data structure.
+        
+        Args:
+            episode: Episode data from LeRobotDataset
+            
+        Returns:
+            Array of shape [num_timesteps, num_joints]
+        """
+        # This is a placeholder - implement based on your LeRobot episode structure
+        # For example, if episodes contain an 'observation.state' key:
+        if 'observations' in episode and len(episode['observations']) > 0:
+            if 'state' in episode['observations'][0]:
+                return np.array([obs['state'] for obs in episode['observations']])
+                
+        # Another possibility - directly accessing 'observation.state' if structured as in the uploaded code
+        if 'observation.state' in episode:
+            return np.array(episode['observation.state'])
+            
+        # If joint data is stored in episode['joint_positions']
+        if 'joint_positions' in episode:
+            return np.array(episode['joint_positions'])
+            
+        # If the episode itself is a sequence of observation states
+        if hasattr(episode, 'shape') and len(episode.shape) == 2:
+            return episode
+            
+        # Fallback - you'll need to implement this based on your data structure
+        raise ValueError("Could not extract trajectory from episode. Please implement _extract_trajectory_from_episode method.")
     
     def _compute_fft(self, window):
         """
@@ -215,6 +210,10 @@ class TrajectoryFFTLabelDataset(Dataset):
     
     def __len__(self):
         """Return the number of samples in the dataset."""
+        # Process data lazily if not already done
+        if not self.processed:
+            self._process_data()
+            
         return len(self.samples)
     
     def __getitem__(self, idx):
@@ -226,6 +225,10 @@ class TrajectoryFFTLabelDataset(Dataset):
             - targets: Tensor with FFT features [num_joints, num_freq_bins]
             - emotion_idx: Emotion index for one-hot encoding later
         """
+        # Process data lazily if not already done
+        if not self.processed:
+            self._process_data()
+            
         sample = self.samples[idx]
         
         # Just use joint state for input
@@ -241,7 +244,7 @@ class TrajectoryFFTLabelDataset(Dataset):
             "emotion_idx": sample["emotion_idx"],
             "metadata": {
                 "emotion": sample["emotion"],
-                "episode_id": sample["episode_id"]
+                "episode_idx": sample["episode_idx"]
             }
         }
     
@@ -272,36 +275,30 @@ class TrajectoryFFTLabelDataset(Dataset):
 
 # Example usage
 if __name__ == "__main__":
-    # Example: create synthetic data for testing
-    num_episodes = 100
-    timesteps_per_episode = 600  # 500-800 samples per trajectory
-    num_joints = 6  # 6-DOF
+    # Example usage with LeRobot configuration
+    import argparse
+    from omegaconf import OmegaConf
     
-    # Create random trajectories
-    np.random.seed(42)
-    trajectories = []
-    task_descriptions = []
-    
-    for i in range(num_episodes):
-        # Create sinusoidal trajectories with different frequencies for each joint
-        t = np.linspace(0, 20, timesteps_per_episode)
-        traj = np.zeros((timesteps_per_episode, num_joints))
-        
-        for j in range(num_joints):
-            freq = 0.5 + j * 0.2  # Different frequency for each joint
-            traj[:, j] = np.sin(2 * np.pi * freq * t) + 0.1 * np.random.randn(len(t))
-        
-        trajectories.append(traj)
-        
-        # Assign random emotions
-        emotions = ['happy', 'angry', 'sad', 'surprised', 'fearful', 'curious', 'playful']
-        emotion = np.random.choice(emotions)
-        task_descriptions.append(f"Move with {emotion} emotion")
+    # Create a sample configuration
+    cfg = OmegaConf.create({
+        "dataset": {
+            "repo_id": "lerobot/emotion_trajectories",
+            "root": "./data",
+            "episodes": None,  # Use all episodes
+            "revision": "main",
+            "video_backend": "opencv"
+        }
+    })
     
     # Create dataset
     dataset = TrajectoryFFTLabelDataset(
-        trajectories=trajectories,
-        task_descriptions=task_descriptions,
+        repo_id=cfg.dataset.repo_id,
+        root=cfg.dataset.root,
+        episodes=cfg.dataset.episodes,
+        delta_timestamps=None,
+        image_transforms=None,
+        revision=cfg.dataset.revision,
+        video_backend=cfg.dataset.video_backend,
         fps=30, 
         window_sec=1.5,
         overlap=0.5,
@@ -323,7 +320,7 @@ if __name__ == "__main__":
         targets = batch["targets"]
         emotion_idx = batch["emotion_idx"]
         metadata = batch["metadata"]
-
+        
         print(f"Batch inputs shape: {inputs.shape}")
         print(f"Batch targets shape: {targets.shape}")
         print(f"Batch emotion indices: {emotion_idx[:5]}")
