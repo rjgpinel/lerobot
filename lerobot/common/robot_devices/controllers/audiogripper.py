@@ -70,7 +70,7 @@ class AudioGripperController:
 
         # Get the directory containing the current script
         script_dir = Path(__file__).parent.resolve()
-        self.audio_file = script_dir / "puppet.mp3"
+        self.audio_file = script_dir / "puppet_speach2.mp3"
 
         self.min_angle = 1
         self.max_angle = 45
@@ -278,9 +278,9 @@ class AudioGripperController:
                 logging.info(f"Generated {len(mouth_positions)} mouth positions from audio chunk")
                 
                 # Store the sequence for playback
-                print("Waiting for lock2")
+                # print("Waiting for lock2")
                 with self.mouthpos_lock:
-                    print(f"Acq lock2")
+                    # print(f"Acq lock2")
                     self.live_mouth_positions = mouth_positions.copy()
                     self.live_timestamps = timestamps.copy()
                     self.live_audio_start_time = current_time
@@ -334,6 +334,8 @@ class AudioGripperController:
         gripper_pos = gripper_abs_pos * (self.max_angle - self.min_angle) + self.min_angle
         self.current_positions[self.config.motor_id] = gripper_pos
         
+        print(self.current_positions)
+
         # For debugging
         logging.debug(f"Updated position: {gripper_pos:.2f}")
 
@@ -401,9 +403,9 @@ class AudioGripperController:
                     last_connection_check = current_time
                 
                 # Process live audio sequence if available
-                print("Waiting for lock1")
+                # print("Waiting for lock1")
                 with self.mouthpos_lock:
-                    print(f"Acq lock1")
+                    # print(f"Acq lock1")
                     has_sequence = self.using_live_sequence and len(self.live_timestamps) > 0
                     if has_sequence:
                         # Get current data

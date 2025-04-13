@@ -1,0 +1,1 @@
+python lerobot/scripts/control_robot.py   --robot.type=so100   --control.type=replay   --control.fps=30   --control.repo_id=rjgpinel/lerobot_emotions --robot.cameras='{}' --control.episode=82 --robot.controllers={}
