@@ -137,13 +137,11 @@ class AudioGripperController:
                         continue
                     
                     # Parse the message
-                    print(f"{time.monotonic()}: Received audio")
                     message = json.loads(data.decode('utf-8'))
                     
                     # Extract emotion and audio data
                     emotion = message.get("emotion", "curious")
                     audio_data = np.array(message.get("audio_data", []))
-                    print(f"{time.monotonic()}: Emotion: {emotion} | audio: {len(audio_data)}")
                     
                     # Update current data
                     with self.lock:
@@ -178,7 +176,7 @@ class AudioGripperController:
             # Calculate RMS of the audio chunk
             rms = np.sqrt(np.mean(np.square(audio)))
             
-            # Apply emotion modifier to the RMS
+            # Apply basic intensity modification
             modified_rms = rms * emotion_mod
             
             # Normalize and clamp to 0-1 range
@@ -187,8 +185,6 @@ class AudioGripperController:
             # Map to gripper position
             gripper_pos = normalized_intensity * (self.max_angle - self.min_angle) + self.min_angle
             
-            print(f"Gripper position: {gripper_pos} | Emotion: {self.current_emotion} | Intensity: {normalized_intensity}")
-
             # Update gripper position
             self.current_positions[self.config.motor_id] = gripper_pos
             
@@ -220,17 +216,20 @@ class AudioGripperController:
         gripper_pos = gripper_abs_pos * (self.max_angle - self.min_angle) + self.min_angle
         self.current_positions[self.config.motor_id] = gripper_pos
 
+    def get_current_emotion(self):
+        """Safely get the current emotion.
+        
+        Returns:
+            str: The current emotion
+        """
+        with self.lock:
+            return self.current_emotion
+
     def audio_callback(self, outdata, frames, time, status):
         """Audio playback callback for synchronization with fallback audio file."""
         chunk = self.audio_data[self.audio_pos:self.audio_pos + frames]
         outdata[:] = chunk.reshape(-1, 1)
         self.audio_pos += frames
-
-    def get_command(self):
-        """
-        Return the current motor positions after reading and processing inputs.
-        """
-        return self.current_positions.copy()
     
     def read_loop(self):
         """Main loop to process audio and control the gripper."""
@@ -267,27 +266,61 @@ class AudioGripperController:
             except Exception as e:
                 logging.error(f"Error in audio processing: {e}")
         else:
-            # Using chatbot mode - just keep the thread alive
+            # Using chatbot mode - actively process received audio data
             logging.info("Using chatbot mode for audio processing")
+            last_processed_time = time.time()
+            no_audio_counter = 0
+            
             while self.running:
-                time.sleep(0.1)
+                current_time = time.time()
                 
-                # If chatbot connection is lost, switch to fallback mode
+                # Check if we have audio data to process
+                with self.lock:
+                    has_audio = self.current_audio is not None and len(self.current_audio) > 0
+                
+                if has_audio:
+                    # Process the current audio chunk again if it's been a while since last processing
+                    # This ensures continuous movement even if audio chunks arrive slowly
+                    if current_time - last_processed_time > 0.02:  # 50Hz update rate
+                        self.process_audio_chunk()
+                        last_processed_time = current_time
+                        no_audio_counter = 0
+                else:
+                    # If no audio for a while, gradually return to rest position
+                    no_audio_counter += 1
+                    if no_audio_counter > 25:  # After ~0.5 seconds of no audio
+                        # Gradually return to initial position
+                        current_pos = self.current_positions[self.config.motor_id]
+                        target_pos = self.config.initial_position
+                        # Move 10% closer to the target position
+                        new_pos = current_pos + 0.1 * (target_pos - current_pos)
+                        self.current_positions[self.config.motor_id] = new_pos
+                
+                # Check if chatbot connection is lost
                 if not self.connected_to_chatbot and self.use_chatbot:
                     logging.warning("Lost connection to chatbot, switching to fallback mode")
                     self.use_chatbot = False
                     return self.read_loop()  # Restart with fallback mode
+                
+                # Short sleep to prevent tight loop
+                time.sleep(0.02)
+
+    def get_command(self):
+        """
+        Return the current motor positions after reading and processing inputs.
+        """
+        return self.current_positions.copy()
 
     def disconnect(self):
-        """Disconnect and clean up resources."""
-        logging.info("Disconnecting AudioGripperController")
-        self.running = False
-        
-        if self.connected_to_chatbot:
-            try:
-                self.socket.close()
-                logging.info("Closed connection to chatbot server")
-            except Exception as e:
-                logging.error(f"Error closing socket: {e}")
+            """Disconnect and clean up resources."""
+            logging.info("Disconnecting AudioGripperController")
+            self.running = False
             
-            self.connected_to_chatbot = False
+            if self.connected_to_chatbot:
+                try:
+                    self.socket.close()
+                    logging.info("Closed connection to chatbot server")
+                except Exception as e:
+                    logging.error(f"Error closing socket: {e}")
+                
+                self.connected_to_chatbot = False
