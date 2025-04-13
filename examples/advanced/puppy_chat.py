@@ -265,7 +265,7 @@ curious|What brings you to the hackathon today?"""
             generator = self.tts_pipeline(
                 enhanced_text, 
                 voice=self.voice, 
-                rate=0.85  # Slow down speech by using 85% of normal speed
+                speed=0.85  # Slow down speech by using 85% of normal speed
             )
             
             for _, _, audio in generator:
