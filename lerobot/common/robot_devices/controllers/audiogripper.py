@@ -122,7 +122,7 @@ class AudioGripperController:
         self.generate_mouth_values()
 
         # Start the thread to read inputs
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
         
         # Start the thread to receive data from chatbot
         if self.connected_to_chatbot:
@@ -273,16 +273,17 @@ class AudioGripperController:
                     frame_time = current_time + (start / RATE)
                     timestamps.append(frame_time)
                 
-                logging.debug(f"Generated {len(mouth_positions)} mouth positions from audio chunk")
+                logging.info(f"Generated {len(mouth_positions)} mouth positions from audio chunk")
                 
                 # Store the sequence for playback
+
                 with self.lock:
                     self.live_mouth_positions = mouth_positions
                     self.live_timestamps = timestamps
                     self.live_audio_start_time = current_time
                     self.using_live_sequence = True
             else:
-                logging.debug(f"Audio chunk too small: {num_samples} samples, need at least {FRAME_SIZE}")
+                logging.info(f"Audio chunk too small: {num_samples} samples, need at least {FRAME_SIZE}")
             
         except Exception as e:
             logging.error(f"Error processing live audio: {e}")
@@ -426,6 +427,7 @@ class AudioGripperController:
                 else:
                     # When no active sequence, gradually return to rest position
                     # Gradually return to initial position
+
                     current_pos = self.current_positions[self.config.motor_id]
                     target_pos = self.config.initial_position
                     
