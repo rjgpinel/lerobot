@@ -93,6 +93,13 @@ class AudioGripperController:
         self.current_idx = 0
         self.last_process_time = 0
         
+        # For live sequence playback
+        self.live_mouth_positions = []
+        self.live_timestamps = []
+        self.live_audio_start_time = 0
+        self.using_live_sequence = False
+        self.live_current_idx = 0
+        
         # Socket connection to chatbot
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.connected_to_chatbot = False
@@ -209,58 +216,73 @@ class AudioGripperController:
         This ensures we use identical processing for both audio sources.
         """
         try:
-            # Only process at most every 50ms to avoid too frequent updates
             current_time = time.time()
-            if current_time - self.last_process_time < 0.05:
-                return
-                
-            self.last_process_time = current_time
-            
-            # Log input data for debugging
-            audio_min = np.min(audio_data)
-            audio_max = np.max(audio_data)
-            audio_abs_max = max(abs(audio_min), abs(audio_max))
-            logging.debug(f"Audio data shape: {audio_data.shape}, min: {audio_min:.2e}, max: {audio_max:.2e}, abs max: {audio_abs_max:.2e}")
             
             # Get the emotion modifier
             emotion_mod = EMOTION_INTENSITY.get(emotion, 1.0)
             
-            # Calculate RMS energy directly (direct equivalent of librosa.feature.rms)
-            rms = np.sqrt(np.mean(np.square(audio_data)))
-            logging.debug(f"Raw RMS value: {rms:.6f}")
-            
-            # Normalize RMS based on audio characteristics
-            # Fixed lower and upper bounds based on expected audio levels
+            # Fixed parameters for audio processing
             MIN_MOUTH_RMS = 0.05     # Minimum RMS that should start moving the mouth
             MAX_MOUTH_RMS = 0.30     # RMS value that corresponds to fully open mouth
+            FRAME_SIZE = 1024        # Size of each frame to process
+            HOP_LENGTH = 512         # Hop length between frames
             
-            # Scale RMS based on observed values (from debug output)
-            # Your example showed tiny values, so we scale up appropriately
-            if audio_abs_max < 1e-5:  # For tiny values like those in debug output
-                scaled_rms = rms * 1e7
-            else:
-                # For larger values, we might not need as much scaling
-                scaled_rms = rms
+            # Detect if we need to scale the audio (for very small values)
+            audio_abs_max = max(abs(np.min(audio_data)), abs(np.max(audio_data)))
+            scale_factor = 1.0
+            if audio_abs_max < 1e-5:
+                scale_factor = 1e7
+                audio_data = audio_data * scale_factor
+            
+            # Process audio data in frames to generate a series of mouth positions
+            num_samples = len(audio_data)
+            mouth_positions = []
+            timestamps = []
+            
+            # Only process if we have enough data
+            if num_samples >= FRAME_SIZE:
+                # Calculate how many frames we can extract
+                num_frames = 1 + (num_samples - FRAME_SIZE) // HOP_LENGTH
                 
-            logging.debug(f"Scaled RMS: {scaled_rms:.6f}")
-            
-            # Apply lower threshold - no movement below this
-            if scaled_rms < MIN_MOUTH_RMS:
-                mouth_value = 0.0
+                # Process each frame
+                for i in range(num_frames):
+                    # Extract frame
+                    start = i * HOP_LENGTH
+                    end = min(start + FRAME_SIZE, num_samples)
+                    frame = audio_data[start:end]
+                    
+                    # Calculate RMS for this frame
+                    frame_rms = np.sqrt(np.mean(np.square(frame)))
+                    
+                    # Map RMS to mouth position
+                    if frame_rms < MIN_MOUTH_RMS:
+                        mouth_value = 0.0
+                    else:
+                        # Map to 0-1 range with proper bounds
+                        normalized_value = (frame_rms - MIN_MOUTH_RMS) / (MAX_MOUTH_RMS - MIN_MOUTH_RMS)
+                        # Clamp to 0-1 range
+                        normalized_value = max(0.0, min(normalized_value, 1.0))
+                        # Apply power curve to make movement more natural
+                        mouth_value = np.power(normalized_value, 0.6) * emotion_mod
+                        # Ensure we don't exceed 1.0 after applying emotion modifier
+                        mouth_value = min(mouth_value, 1.0)
+                    
+                    # Store the mouth position and timestamp
+                    mouth_positions.append(mouth_value)
+                    # Calculate timestamp for this frame (in seconds from now)
+                    frame_time = current_time + (start / RATE)
+                    timestamps.append(frame_time)
+                
+                logging.debug(f"Generated {len(mouth_positions)} mouth positions from audio chunk")
+                
+                # Store the sequence for playback
+                with self.lock:
+                    self.live_mouth_positions = mouth_positions
+                    self.live_timestamps = timestamps
+                    self.live_audio_start_time = current_time
+                    self.using_live_sequence = True
             else:
-                # Map to 0-1 range with proper bounds
-                normalized_value = (scaled_rms - MIN_MOUTH_RMS) / (MAX_MOUTH_RMS - MIN_MOUTH_RMS)
-                # Clamp to 0-1 range
-                normalized_value = max(0.0, min(normalized_value, 1.0))
-                # Apply power curve to make movement more natural
-                mouth_value = np.power(normalized_value, 0.6) * emotion_mod
-                # Ensure we don't exceed 1.0 after applying emotion modifier
-                mouth_value = min(mouth_value, 1.0)
-            
-            logging.debug(f"Final mouth value: {mouth_value:.4f}")
-            
-            # Update the current position directly using the function that works for default audio
-            self._update_current_position(mouth_value) 
+                logging.debug(f"Audio chunk too small: {num_samples} samples, need at least {FRAME_SIZE}")
             
         except Exception as e:
             logging.error(f"Error processing live audio: {e}")
@@ -355,8 +377,7 @@ class AudioGripperController:
             except Exception as e:
                 logging.error(f"Error in audio processing: {e}")
         else:
-            # Using chatbot mode - this is now just a monitoring loop
-            # since processing happens directly in receive_from_chatbot
+            # Using chatbot mode - now plays back the sequence of mouth positions
             logging.info("Using chatbot mode for audio processing")
             
             last_connection_check = time.time()
@@ -372,25 +393,50 @@ class AudioGripperController:
                         return self.read_loop()  # Restart with fallback mode
                     last_connection_check = current_time
                 
-                # When no speech is detected, gradually return to rest position
+                # Process live audio sequence if available
                 with self.lock:
-                    # Check if we've received updates recently
-                    audio_timestamp = getattr(self, 'last_process_time', 0)
-                    inactive_time = current_time - audio_timestamp
+                    has_sequence = self.using_live_sequence and len(self.live_timestamps) > 0
+                    if has_sequence:
+                        # Get current data
+                        timestamps = self.live_timestamps.copy()
+                        mouth_positions = self.live_mouth_positions.copy()
+                        start_time = self.live_audio_start_time
+                        current_idx = self.live_current_idx
+                
+                if has_sequence:
+                    # Play back the sequence
+                    elapsed = current_time - start_time
                     
-                    if inactive_time > 0.5:  # No updates for 500ms
-                        # Gradually return to initial position
-                        current_pos = self.current_positions[self.config.motor_id]
-                        target_pos = self.config.initial_position
+                    # Find the next position to play
+                    while current_idx < len(timestamps) and elapsed >= (timestamps[current_idx] - start_time):
+                        # Update position
+                        if current_idx < len(mouth_positions):
+                            self._update_current_position(mouth_positions[current_idx])
+                            logging.debug(f"Playing mouth position {current_idx}: {mouth_positions[current_idx]:.4f}")
+                        current_idx += 1
+                    
+                    # Update the current index
+                    with self.lock:
+                        self.live_current_idx = current_idx
                         
-                        # Only update if we're not already at rest position
-                        if abs(current_pos - target_pos) > 0.01:
-                            # Move 10% closer to the target position
-                            new_pos = current_pos + 0.1 * (target_pos - current_pos)
-                            self.current_positions[self.config.motor_id] = new_pos
+                        # Check if we've finished the sequence
+                        if current_idx >= len(timestamps):
+                            self.using_live_sequence = False
+                            logging.debug("Finished playing mouth sequence")
+                else:
+                    # When no active sequence, gradually return to rest position
+                    # Gradually return to initial position
+                    current_pos = self.current_positions[self.config.motor_id]
+                    target_pos = self.config.initial_position
+                    
+                    # Only update if we're not already at rest position
+                    if abs(current_pos - target_pos) > 0.01:
+                        # Move 10% closer to the target position
+                        new_pos = current_pos + 0.1 * (target_pos - current_pos)
+                        self.current_positions[self.config.motor_id] = new_pos
                 
                 # Short sleep to prevent tight loop
-                time.sleep(0.02)
+                time.sleep(0.001)  # High-precision timing like in default audio
 
     def get_command(self):
         """
