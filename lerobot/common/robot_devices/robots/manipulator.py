@@ -460,19 +460,29 @@ class ManipulatorRobot:
 
         # Send goal position to the follower
         follower_goal_pos = {}
+        follower_old_pos = {}
         for name in self.follower_arms:
             before_fwrite_t = time.perf_counter()
             goal_pos = leader_pos[name]
 
+            follower_old_pos[name] = self.follower_arms[name].read("Present_Position")
+            follower_old_pos[name] = torch.from_numpy(follower_old_pos[name])
+            self.logs[f"read_follower_{name}_pos_dt_s"] = time.perf_counter() - before_fwrite_t
+
             # Cap goal position when too far away from present position.
             # Slower fps expected due to reading from the follower.
             if self.config.max_relative_target is not None:
-                present_pos = self.follower_arms[name].read("Present_Position")
-                present_pos = torch.from_numpy(present_pos)
+                # present_pos = self.follower_arms[name].read("Present_Position")
+                # present_pos = torch.from_numpy(present_pos)
+                present_pos = follower_old_pos[name]
                 goal_pos = ensure_safe_goal_position(goal_pos, present_pos, self.config.max_relative_target)
 
             # Used when record_data=True
             follower_goal_pos[name] = goal_pos
+
+            # add Gaussian noise to the goal position
+            noise = torch.randn_like(goal_pos) * 0.1
+            goal_pos += noise
 
             goal_pos = goal_pos.numpy().astype(np.float32)
             self.follower_arms[name].write("Goal_Position", goal_pos)
@@ -484,18 +494,18 @@ class ManipulatorRobot:
 
         # TODO(rcadene): Add velocity and other info
         # Read follower position
-        follower_pos = {}
-        for name in self.follower_arms:
-            before_fread_t = time.perf_counter()
-            follower_pos[name] = self.follower_arms[name].read("Present_Position")
-            follower_pos[name] = torch.from_numpy(follower_pos[name])
-            self.logs[f"read_follower_{name}_pos_dt_s"] = time.perf_counter() - before_fread_t
+        # follower_new_pos = {}
+        # for name in self.follower_arms:
+        #     before_fread_t = time.perf_counter()
+        #     follower_new_pos[name] = self.follower_arms[name].read("Present_Position")
+        #     follower_new_pos[name] = torch.from_numpy(follower_new_pos[name])
+        #     self.logs[f"read_follower_{name}_pos_dt_s"] = time.perf_counter() - before_fread_t
 
         # Create state by concatenating follower current position
         state = []
         for name in self.follower_arms:
-            if name in follower_pos:
-                state.append(follower_pos[name])
+            if name in follower_old_pos:
+                state.append(follower_old_pos[name])
         state = torch.cat(state)
 
         # Create action by concatenating follower goal position
