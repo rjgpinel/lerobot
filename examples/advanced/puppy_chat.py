@@ -62,7 +62,10 @@ class RobotChatbot:
         
         # Message history for context
         self.history = []
-        
+
+        # Flag to indicate running state
+        self.running = True
+
         # Create socket server
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
@@ -77,9 +80,6 @@ class RobotChatbot:
         except OSError as e:
             logging.error(f"Socket error: {e}")
             self.sock = None
-
-        # Flag to indicate running state
-        self.running = True
         
         # Connection to AudioGripperController
         self.connection = None

@@ -137,11 +137,13 @@ class AudioGripperController:
                         continue
                     
                     # Parse the message
+                    print(f"{time.monotonic()}: Received audio")
                     message = json.loads(data.decode('utf-8'))
                     
                     # Extract emotion and audio data
                     emotion = message.get("emotion", "curious")
                     audio_data = np.array(message.get("audio_data", []))
+                    print(f"{time.monotonic()}: Emotion: {emotion} | audio: {len(audio_data)}")
                     
                     # Update current data
                     with self.lock:
