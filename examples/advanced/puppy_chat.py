@@ -66,6 +66,10 @@ class RobotChatbot:
         # Create socket server
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+
+        # Flag to indicate running state
+        self.running = True
+
         try:
             self.sock.bind((HOST, PORT))
             self.sock.listen()
@@ -78,9 +82,6 @@ class RobotChatbot:
         except OSError as e:
             logging.error(f"Socket error: {e}")
             self.sock = None
-
-        # Flag to indicate running state
-        self.running = True
         
         # Connection to AudioGripperController
         self.connection = None
