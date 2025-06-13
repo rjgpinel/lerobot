@@ -2,6 +2,7 @@
 Modified AudioGripperController that connects to the chatbot server to receive
 audio data and emotion information for controlling the gripper.
 Uses identical processing pathways for both live and default audio.
+Optimized to handle large audio streams efficiently.
 """
 
 from lerobot.common.robot_devices.controllers.configs import AudioGripperControllerConfig
@@ -63,7 +64,7 @@ class AudioGripperController:
 
         # Configure logging for better diagnostics
         logging.basicConfig(
-            level=logging.DEBUG,
+            level=logging.INFO,  # Changed to INFO to reduce log volume
             format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
         )
         logging.info("Initializing AudioGripperController with shared processing paths")
@@ -91,14 +92,10 @@ class AudioGripperController:
         self.mouth_values = []
         self.times = []
         self.current_idx = 0
-        self.last_process_time = 0
         
-        # For live sequence playback
-        self.live_mouth_positions = []
-        self.live_timestamps = []
-        self.live_audio_start_time = 0
-        self.using_live_sequence = False
-        self.live_current_idx = 0
+        # For live sequence playback - simplified to avoid locks
+        self.current_mouth_position = 0.0
+        self.last_update_time = time.time()
         
         # Socket connection to chatbot
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -121,9 +118,8 @@ class AudioGripperController:
         # so we can reuse the exact same function
         self.generate_mouth_values()
 
-        # Start the thread to read inputs
-        self.mouthpos_lock = threading.RLock()
-        self.lock = threading.RLock()
+        # Just use a single lock for simplicity
+        self.lock = threading.Lock()
         
         # Start the thread to receive data from chatbot
         if self.connected_to_chatbot:
@@ -135,7 +131,6 @@ class AudioGripperController:
         self.thread.start()
 
     def receive_from_chatbot(self):
-        print(f"DFPRINT receive_from_chatbot")
         """Receive audio data and emotion from the chatbot server."""
         logging.info("Starting to receive data from chatbot")
         try:
@@ -184,13 +179,12 @@ class AudioGripperController:
                         continue
                     
                     # If we received audio data, process it through the same pathway 
-                    # as the default audio
+                    # as the default audio - but without locks
                     if len(audio_data) > 0:
-                        # with self.lock:
-                            # Process this audio chunk immediately
+                        # Process this audio chunk immediately
                         self.process_live_audio_chunk(audio_data, emotion)
                     
-                    # Update emotion
+                    # Update emotion - no lock needed as this is atomic
                     self.current_emotion = emotion
                     self.emotion_modifier = EMOTION_INTENSITY.get(emotion, 1.0)
                     
@@ -200,7 +194,7 @@ class AudioGripperController:
                     logging.error(traceback.format_exc())
                     time.sleep(0.1)  # Prevent tight loop on error
 
-                time.sleep(0.0005)
+                time.sleep(0.001)  # Small delay to prevent tight loop
         
         except Exception as e:
             logging.error(f"Chatbot communication thread crashed: {e}")
@@ -212,12 +206,11 @@ class AudioGripperController:
             self.use_chatbot = False
 
     def process_live_audio_chunk(self, audio_data, emotion="curious"):
-        print(f"DFPRINT process_live_audio_chunk")
         """
-        Process a chunk of live audio using the SAME function that successfully
-        processes the default audio.
+        Process a chunk of live audio and update the mouth position.
+        Simplified to avoid lock contention and handle large audio streams.
         
-        This ensures we use identical processing for both audio sources.
+        Only processes a subset of frames to avoid overload.
         """
         try:
             current_time = time.time()
@@ -230,6 +223,7 @@ class AudioGripperController:
             MAX_MOUTH_RMS = 0.50     # RMS value that corresponds to fully open mouth
             FRAME_SIZE = 1024        # Size of each frame to process
             HOP_LENGTH = 512         # Hop length between frames
+            FRAME_SKIP = 10          # Process only every Nth frame to reduce load
             
             # Detect if we need to scale the audio (for very small values)
             audio_abs_max = max(abs(np.min(audio_data)), abs(np.max(audio_data)))
@@ -238,26 +232,39 @@ class AudioGripperController:
                 scale_factor = 1e7
                 audio_data = audio_data * scale_factor
             
-            # Process audio data in frames to generate a series of mouth positions
+            # Process audio data in frames, but only a subset of frames
             num_samples = len(audio_data)
-            mouth_positions = []
-            timestamps = []
             
             # Only process if we have enough data
             if num_samples >= FRAME_SIZE:
                 # Calculate how many frames we can extract
                 num_frames = 1 + (num_samples - FRAME_SIZE) // HOP_LENGTH
                 
-                # Process each frame
-                for i in range(0, num_frames, 2):
+                # For large audio chunks, limit processing to avoid overload
+                max_frames_to_process = 5  # Only process at most 5 frames
+                frames_to_process = min(num_frames, max_frames_to_process)
+                
+                # Calculate which frames to process (evenly spaced)
+                if num_frames <= max_frames_to_process:
+                    frame_indices = range(num_frames)
+                else:
+                    # Pick frames evenly spaced throughout the chunk
+                    frame_indices = [int(i * (num_frames / frames_to_process)) for i in range(frames_to_process)]
+                
+                # Keep track of the max mouth value in this chunk
+                max_mouth_value = 0.0
+                
+                # Process selected frames
+                for i in frame_indices:
                     # Extract frame
                     start = i * HOP_LENGTH
                     end = min(start + FRAME_SIZE, num_samples)
                     frame = audio_data[start:end]
                     
+                    # Amplify the frame slightly to make movements more visible
                     frame *= 2
-
-                    # # Calculate RMS for this frame
+                    
+                    # Calculate RMS for this frame
                     frame_rms = np.sqrt(np.mean(np.square(frame)))
                     
                     # Map to 0-1 range with proper bounds
@@ -269,13 +276,13 @@ class AudioGripperController:
                     # Ensure we don't exceed 1.0 after applying emotion modifier
                     mouth_value = min(mouth_value, 1.0)
                     
-                    # Store the mouth position and timestamp
-                    mouth_positions.append(mouth_value)
-                    # Calculate timestamp for this frame (in seconds from now)
-                    frame_time = current_time + (start / RATE)
-                    timestamps.append(frame_time)
+                    # Update max value
+                    max_mouth_value = max(max_mouth_value, mouth_value)
                 
-                logging.info(f"Generated {len(mouth_positions)} mouth positions from audio chunk")
+                # Use the maximum mouth value from this chunk
+                # This simplifies the logic and avoids lock contention
+                self.current_mouth_position = max_mouth_value
+                self.last_update_time = current_time
                 
                 # Store the sequence for playback
                 # print("Waiting for lock2")
@@ -294,7 +301,6 @@ class AudioGripperController:
             logging.error(traceback.format_exc())
 
     def generate_mouth_values(self):
-        print(f"DFPRINT generate_mouth_values")
         """Extract time-synchronized mouth opening estimates from default audio file."""
         try:
             logging.info(f"Generating mouth values from {self.audio_file}")
@@ -317,7 +323,6 @@ class AudioGripperController:
             self.mouth_values = []
 
     def _update_current_position(self, absolute_value):
-        print(f"DFPRINT _update_current_position: {absolute_value}")
         """Update gripper position based on audio intensity."""
         # This is the SHARED function used by both default and live audio paths
         
@@ -340,19 +345,16 @@ class AudioGripperController:
         logging.debug(f"Updated position: {gripper_pos:.2f}")
 
     def get_current_emotion(self):
-        print(f"DFPRINT get_current_emotion")
         """Safely get the current emotion."""
         return self.current_emotion
 
     def audio_callback(self, outdata, frames, time, status):
-        print(f"DFPRINT audio_callback")
         """Audio playback callback for synchronization with fallback audio file."""
         chunk = self.audio_data[self.audio_pos:self.audio_pos + frames]
         outdata[:] = chunk.reshape(-1, 1)
         self.audio_pos += frames
     
     def read_loop(self):
-        print(f"DFPRINT read_loop")
         """Main loop to process audio and control the gripper."""
         logging.info("Starting audio processing loop")
         
@@ -386,8 +388,8 @@ class AudioGripperController:
             except Exception as e:
                 logging.error(f"Error in audio processing: {e}")
         else:
-            # Using chatbot mode - now plays back the sequence of mouth positions
-            logging.info("Using chatbot mode for audio processing")
+            # Using chatbot mode - greatly simplified to avoid lock contention
+            logging.info("Using chatbot mode for audio processing (simplified)")
             
             last_connection_check = time.time()
             
@@ -447,9 +449,10 @@ class AudioGripperController:
                         new_pos = current_pos + 0.1 * (target_pos - current_pos)
                         self.current_positions[self.config.motor_id] = new_pos
                 
-                # Short sleep to prevent tight loop
-                time.sleep(0.0005)  # High-precision timing like in default audio
-            print(f"Done running")
+                # Short sleep to prevent tight loop - but not too long
+                time.sleep(0.001)  # 1ms sleep is enough
+            
+            logging.info("Audio processing loop finished")
 
     def get_command(self):
         """
@@ -458,7 +461,6 @@ class AudioGripperController:
         return self.current_positions.copy()
 
     def disconnect(self):
-        print(f"DFPRINT disconnect")
         """Disconnect and clean up resources."""
         logging.info("Disconnecting AudioGripperController")
         self.running = False
